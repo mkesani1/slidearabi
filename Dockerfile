@@ -32,7 +32,7 @@ RUN mkdir -p /tmp/slideshift_jobs
 EXPOSE 8000
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s \
     CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
 
 # Run with uvicorn; Railway sets PORT env var

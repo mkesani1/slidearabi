@@ -8,6 +8,9 @@ uvicorn[standard]==0.34.0
 # PowerPoint processing
 python-pptx==1.0.2
 
+# XML processing (used by rtl_transforms, typography, utils, vqa_engine, etc.)
+lxml>=5.0
+
 # Payment processing
 stripe==11.4.1
 
