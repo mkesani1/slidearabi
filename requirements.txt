@@ -17,6 +17,9 @@ stripe==11.4.1
 # Image processing (for VQA slide rendering)
 Pillow>=10.0
 
+# File upload support (required by FastAPI for UploadFile/Form)
+python-multipart>=0.0.9
+
 # Pydantic (FastAPI dependency, pin for stability)
 pydantic>=2.0,<3.0
 
