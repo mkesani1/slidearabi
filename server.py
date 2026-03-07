@@ -80,6 +80,7 @@ app.add_middleware(
         "https://slidearabi.com",
         "https://www.slidearabi.com",
         "http://localhost:3000",
+        "*",  # TODO: remove wildcard once frontend is on slidearabi.com
     ],
     allow_methods=["*"],
     allow_headers=["*"],
