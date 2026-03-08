@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -6,6 +7,12 @@ from typing import Dict, List, Optional, Callable, Any
 from pptx import Presentation
 
 logger = logging.getLogger(__name__)
+
+# Broad Arabic detection covering all Arabic Unicode blocks:
+# Basic Arabic (0600-06FF), Arabic Supplement (0750-077F),
+# Arabic Extended-A (08A0-08FF), Presentation Forms-A (FB50-FDFF),
+# Presentation Forms-B (FE70-FEFF)
+_ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
 
 # ── Module imports — each isolated so one missing module doesn't break all ──
 
@@ -147,6 +154,38 @@ class SlideArabiPipeline:
             # Phase 3: Transform Slide Content
             p3_report = self._phase_3_transform_slides(prs, resolved_prs, translation_map)
             
+            # ── POST-TRANSFORM VERIFICATION ──────────────────────────────
+            # Belt-and-suspenders: sample the in-memory prs for Arabic text
+            # before saving. If translation_map had entries but no Arabic
+            # text ended up in the presentation, something went wrong in
+            # Phase 3's apply logic.
+            if not self.config.skip_translation and translation_map:
+                arabic_found = False
+                sample_texts = []
+                for slide in prs.slides:
+                    for shape in slide.shapes:
+                        if hasattr(shape, 'has_text_frame') and shape.has_text_frame:
+                            for para in shape.text_frame.paragraphs:
+                                text = para.text.strip()
+                                if text:
+                                    sample_texts.append(text[:80])
+                                    if _ARABIC_RE.search(text):
+                                        arabic_found = True
+                                        break
+                        if arabic_found:
+                            break
+                    if arabic_found:
+                        break
+                
+                if not arabic_found:
+                    raise RuntimeError(
+                        "FATAL: Post-transform verification failed. "
+                        f"Translation map has {len(translation_map)} entries but "
+                        "NO Arabic text found in output presentation. "
+                        f"Sample texts from output: {sample_texts[:5]}"
+                    )
+                logger.info("Post-transform verification PASSED: Arabic text confirmed in output")
+            
             # Phase 4: Typography Normalization
             p4_report = self._phase_4_typography(prs)
             
@@ -190,20 +229,42 @@ class SlideArabiPipeline:
             )
         
     def _phase_0_resolve(self, prs: Presentation) -> Any:
-        """Phase 0: Parse the presentation and resolve all inherited properties."""
+        """Phase 0: Parse the presentation and resolve all inherited properties.
+        
+        FAIL-CLOSED: If PropertyResolver is unavailable and translation is
+        enabled, this raises immediately. A missing resolver means zero text
+        extraction, zero translations, and an English-copy output — which is
+        a silent failure the user would see as "not working".
+        """
         start_time = time.monotonic()
         logger.info("Phase 0: Resolving properties...")
         
         if not HAS_PROPERTY_RESOLVER:
-            logger.warning("Phase 0 skipped: PropertyResolver not available")
+            if not self.config.skip_translation:
+                raise RuntimeError(
+                    "FATAL: PropertyResolver module not available but translation is enabled. "
+                    "Cannot extract text without PropertyResolver. "
+                    "Check that slidearabi.property_resolver imports successfully on this environment."
+                )
+            logger.warning("Phase 0 skipped: PropertyResolver not available (translation also skipped)")
             self._log_phase('phase_0_resolve', 0, {"status": "module_unavailable"})
             return None
 
         resolver = PropertyResolver(prs)
         resolved_prs = resolver.resolve_presentation()
         
+        if not resolved_prs or not getattr(resolved_prs, 'slides', None):
+            raise RuntimeError(
+                f"FATAL: PropertyResolver returned empty result. "
+                f"resolved_prs={resolved_prs}, "
+                f"slides={getattr(resolved_prs, 'slides', 'N/A')}"
+            )
+        
         duration = (time.monotonic() - start_time) * 1000
-        self._log_phase('phase_0_resolve', duration, {"status": "success", "slides_resolved": len(prs.slides)})
+        self._log_phase('phase_0_resolve', duration, {
+            "status": "success",
+            "slides_resolved": len(prs.slides),
+        })
         return resolved_prs
             
     def _phase_1_translate(self, resolved: Any) -> Dict[str, str]:
@@ -224,16 +285,50 @@ class SlideArabiPipeline:
         texts_to_translate = self._extract_texts(resolved)
         logger.info(f"Extracted {len(texts_to_translate)} strings for translation.")
         
+        # ── ZERO-TOLERANCE GATE: refuse to continue with zero texts ──
+        if not texts_to_translate:
+            raise RuntimeError(
+                "FATAL: _extract_texts returned 0 strings. "
+                f"resolved is {'None' if resolved is None else 'valid (' + str(len(getattr(resolved, 'slides', []))) + ' slides)'}. "
+                f"HAS_PROPERTY_RESOLVER={HAS_PROPERTY_RESOLVER}. "
+                "Refusing to proceed — output would be an untranslated English copy."
+            )
+        
         try:
             translation_map = self.config.translate_fn(texts_to_translate)
+            
+            # ── ZERO-TOLERANCE GATE: refuse empty translation map ──
+            if not translation_map:
+                raise RuntimeError(
+                    f"FATAL: translate_fn returned 0 translations for "
+                    f"{len(texts_to_translate)} input strings. "
+                    "API call may have failed silently. "
+                    "Refusing to save untranslated output."
+                )
+            
+            coverage_pct = (len(translation_map) / len(texts_to_translate)) * 100
+            logger.info(
+                "Translation coverage: %d/%d strings (%.1f%%)",
+                len(translation_map), len(texts_to_translate), coverage_pct,
+            )
+            if coverage_pct < 10:
+                raise RuntimeError(
+                    f"FATAL: Translation coverage critically low ({coverage_pct:.1f}%). "
+                    f"Only {len(translation_map)}/{len(texts_to_translate)} strings translated. "
+                    "Output would be mostly English."
+                )
             
             duration = (time.monotonic() - start_time) * 1000
             self._log_phase('phase_1_translate', duration, {
                 "status": "success", 
-                "strings_translated": len(translation_map)
+                "strings_extracted": len(texts_to_translate),
+                "strings_translated": len(translation_map),
+                "coverage_pct": round(coverage_pct, 1),
             })
             return translation_map
             
+        except RuntimeError:
+            raise  # Re-raise our own zero-tolerance errors
         except Exception as e:
             logger.error(f"Translation failed: {e}")
             raise RuntimeError(f"Phase 1 (Translation) failed: {e}")
@@ -382,9 +477,13 @@ class SlideArabiPipeline:
                     unique_texts.append(t)
             return unique_texts
             
-        except AttributeError:
-            # Fallback if resolved structure isn't exactly as expected
-            logger.warning("Could not extract texts from resolved presentation structure")
+        except AttributeError as e:
+            # Log the actual error so the zero-tolerance gate's error is debuggable
+            logger.error(
+                "_extract_texts failed due to unexpected structure in resolved presentation: %s",
+                e,
+                exc_info=True,
+            )
             return []
         
     def _phase_6_vqa(
