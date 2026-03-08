@@ -29,7 +29,7 @@ logging.basicConfig(
 logger = logging.getLogger("slidearabi.server")
 
 
-MAX_FILE_SIZE = 50 * 1024 * 1024
+MAX_FILE_SIZE = 150 * 1024 * 1024  # 150 MB
 BASE_DIR = Path("/tmp/slideshift_jobs")
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 JOB_TTL_HOURS = 24
