@@ -318,6 +318,41 @@ class SlideArabiPipeline:
                     "Output would be mostly English."
                 )
             
+            # ── ZERO-TOLERANCE GATE: validate that translation values are actually Arabic ──
+            # This catches the case where translation_map has entries but they
+            # contain English text instead of Arabic (e.g., from a fallback path).
+            arabic_value_count = 0
+            sampled_count = 0
+            sample_non_arabic = []
+            for eng, ar in translation_map.items():
+                eng_stripped = eng.strip()
+                # Skip very short strings, numbers-only, abbreviations
+                if (len(eng_stripped) <= 3
+                        or re.match(r'^[\d\s\-+.,/%$\u20ac\u00a3]+$', eng_stripped)):
+                    continue
+                sampled_count += 1
+                if _ARABIC_RE.search(ar):
+                    arabic_value_count += 1
+                elif len(sample_non_arabic) < 5:
+                    sample_non_arabic.append(
+                        f"EN: {eng_stripped[:60]} -> GOT: {ar[:60]}"
+                    )
+            
+            if sampled_count > 0:
+                arabic_ratio = arabic_value_count / sampled_count
+                logger.info(
+                    "Translation Arabic content ratio: %d/%d (%.1f%%)",
+                    arabic_value_count, sampled_count, arabic_ratio * 100,
+                )
+                if arabic_ratio < 0.5:
+                    raise RuntimeError(
+                        f"FATAL: Translation content check failed. "
+                        f"Only {arabic_value_count}/{sampled_count} translated strings "
+                        f"({arabic_ratio*100:.1f}%) contain Arabic characters. "
+                        f"This indicates the translation API returned English text. "
+                        f"Samples without Arabic: {sample_non_arabic}"
+                    )
+            
             duration = (time.monotonic() - start_time) * 1000
             self._log_phase('phase_1_translate', duration, {
                 "status": "success", 
