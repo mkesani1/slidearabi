@@ -5,6 +5,17 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.enum.text import PP_ALIGN
 
+# Namespace URIs for Clark-notation element access (python-pptx wraps lxml
+# and doesn't support the 'namespaces' kwarg on xpath — use findall instead).
+_A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+_P_NS = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+_C_NS = 'http://schemas.openxmlformats.org/drawingml/2006/chart'
+
+def _qn(prefix: str, local: str) -> str:
+    """Build a Clark-notation tag: _qn('p', 'txStyles') → '{ns}txStyles'."""
+    ns = {'a': _A_NS, 'p': _P_NS, 'c': _C_NS}[prefix]
+    return f'{{{ns}}}{local}'
+
 class IssueType:
     RTL_MISSING = 'rtl_missing'              # Arabic paragraph without rtl='1'
     ALIGNMENT_WRONG = 'alignment_wrong'       # Arabic text with wrong alignment
@@ -414,7 +425,14 @@ class StructuralValidator:
                 # To truly check, we'd need to inspect the c:scaling/c:orientation element
                 # which isn't directly exposed as 'reverse_order' in older python-pptx
                 # We'd use axis._element.xpath('.//c:orientation/@val')
-                orientations = axis._element.xpath('.//c:scaling/c:orientation/@val')
+                # Navigate chart XML: c:scaling → c:orientation → @val
+                scaling_elems = axis._element.findall(f'.//{_qn("c", "scaling")}')
+                orientations = []
+                for sc in scaling_elems:
+                    for orient in sc.findall(_qn('c', 'orientation')):
+                        val = orient.get('val')
+                        if val:
+                            orientations.append(val)
                 if orientations and orientations[0] != 'maxMin':
                     issues.append(ValidationIssue(
                         severity='error',
@@ -477,17 +495,17 @@ class StructuralValidator:
         
         for i, master in enumerate(self.prs.slide_masters):
             # Check txStyles (titleStyle, bodyStyle, otherStyle)
-            txStyles = master._element.xpath('./p:txStyles')
+            txStyles = master._element.findall(_qn('p', 'txStyles'))
             if not txStyles:
                 continue
                 
             for style_name in ['titleStyle', 'bodyStyle', 'otherStyle']:
-                styles = txStyles[0].xpath(f'./p:{style_name}')
+                styles = txStyles[0].findall(_qn('p', style_name))
                 if not styles:
                     continue
                     
                 # Check lvl1pPr RTL setting
-                lvl1pPr = styles[0].xpath('./a:lvl1pPr')
+                lvl1pPr = styles[0].findall(_qn('a', 'lvl1pPr'))
                 if lvl1pPr:
                     rtl = lvl1pPr[0].get('rtl')
                     if rtl != '1':
