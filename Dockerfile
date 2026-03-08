@@ -16,7 +16,6 @@ RUN apt-get update && \
         fonts-noto-extra \
         fonts-noto-cjk \
         fonts-hosny-amiri \
-        fonts-kacst \
     && fc-cache -fv \
     && rm -rf /var/lib/apt/lists/*
 
