@@ -34,6 +34,15 @@ BASE_DIR = Path("/tmp/slideshift_jobs")
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 JOB_TTL_HOURS = 24
 
+# Validate critical environment variables at startup
+for _env_var in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]:
+    _val = os.getenv(_env_var, "")
+    if not _val:
+        logger.critical("MISSING: %s environment variable is not set!", _env_var)
+    elif len(_val) < 10:
+        logger.critical("INVALID: %s appears too short (%d chars)", _env_var, len(_val))
+del _env_var, _val
+
 PIPELINE_SEMAPHORE = threading.Semaphore(1)
 JOBS_LOCK = threading.Lock()
 
@@ -153,7 +162,7 @@ def _render_preview_slides(input_path: Path, preview_dir: Path, max_slides: int 
         str(preview_dir),
         str(input_path),
     ]
-    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
 
     generated = sorted(preview_dir.glob("*.jpg"))
     previews = []
@@ -173,6 +182,14 @@ def _build_translate_fn():
     """Build a translate_fn matching the pipeline's signature: List[str] → Dict[str, str]."""
     openai_key = os.getenv("OPENAI_API_KEY", "")
     anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
+
+    if not openai_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not configured. "
+            "Set it in Railway environment variables."
+        )
+    if not anthropic_key:
+        logger.warning("ANTHROPIC_API_KEY not set — Claude QA pass will be skipped")
 
     config = TranslatorConfig(
         openai_api_key=openai_key,
@@ -239,13 +256,23 @@ def _run_pipeline_worker(job_id: str) -> None:
         pipeline = SlideArabiPipeline(config=cfg)
 
         _set_job_state(job_id, current_phase=PHASE_TRANSLATING, progress_pct=25)
-        pipeline.run()
+        result = pipeline.run()
+
+        if not result.success:
+            error_msg = result.error or "Pipeline failed (unknown internal error)"
+            logger.error(
+                "Pipeline returned failure for job %s: %s | phase_reports=%s",
+                job_id,
+                error_msg,
+                list(result.phase_reports.keys()) if result.phase_reports else [],
+            )
+            raise RuntimeError(error_msg)
 
         _set_job_state(job_id, current_phase=PHASE_RTL, progress_pct=70)
         _set_job_state(job_id, current_phase=PHASE_QC, progress_pct=90)
 
         if not output_path.exists():
-            raise RuntimeError("Pipeline finished but output file missing")
+            raise RuntimeError("Pipeline reported success but output file missing")
 
         _set_job_state(
             job_id,
@@ -262,7 +289,6 @@ def _run_pipeline_worker(job_id: str) -> None:
             job_id,
             status="failed",
             error=str(exc),
-            current_phase=PHASE_DONE,
         )
     finally:
         PIPELINE_SEMAPHORE.release()
@@ -350,6 +376,7 @@ def status(job_id: str):
                 "progress_pct": max(0, min(100, job.progress_pct)),
                 "current_phase": job.current_phase,
                 "total_slides": job.total_slides,
+                "error": job.error if job.status == "failed" else None,
             }
     except HTTPException:
         raise
