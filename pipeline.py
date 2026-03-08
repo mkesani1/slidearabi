@@ -7,41 +7,76 @@ from pptx import Presentation
 
 logger = logging.getLogger(__name__)
 
-# These modules are built by other agents and will be available at runtime
-# Import them at the top but handle ImportError gracefully for testing
+# ── Module imports — each isolated so one missing module doesn't break all ──
+
+HAS_PROPERTY_RESOLVER = False
 try:
     from slidearabi.property_resolver import PropertyResolver
-    from slidearabi.layout_analyzer import LayoutAnalyzer
-    from slidearabi.template_registry import TemplateRegistry
-    from slidearabi.rtl_transforms import MasterLayoutTransformer, SlideContentTransformer
-    from slidearabi.typography import TypographyNormalizer
-    from slidearabi.structural_validator import StructuralValidator
-    from slidearabi.models import (
-        ResolvedPresentation, TransformReport, ValidationReport,
-        PipelineConfig, PipelineResult
-    )
+    HAS_PROPERTY_RESOLVER = True
 except ImportError as e:
-    logger.warning(f"Some v2 modules not yet available: {e}")
-    
-    # Stub models for development/testing if real ones aren't available
-    @dataclass
-    class PipelineConfig:
-        input_path: str
-        output_path: str
-        translate_fn: Optional[Callable[[List[str]], Dict[str, str]]] = None
-        skip_translation: bool = False
-        max_font_reduction_pct: float = 20.0
-        log_level: str = 'INFO'
-        enable_telemetry: bool = False
-        
-    @dataclass
-    class PipelineResult:
-        success: bool
-        output_path: Optional[str]
-        phase_reports: Dict[str, Any]
-        validation_report: Optional[Any]
-        total_duration_ms: float
-        error: Optional[str] = None
+    logger.warning(f"PropertyResolver not available: {e}")
+
+HAS_LAYOUT_ANALYZER = False
+try:
+    from slidearabi.layout_analyzer import LayoutAnalyzer
+    HAS_LAYOUT_ANALYZER = True
+except ImportError as e:
+    logger.warning(f"LayoutAnalyzer not available: {e}")
+
+HAS_TEMPLATE_REGISTRY = False
+try:
+    from slidearabi.template_registry import TemplateRegistry
+    HAS_TEMPLATE_REGISTRY = True
+except ImportError as e:
+    logger.warning(f"TemplateRegistry not available: {e}")
+
+HAS_RTL_TRANSFORMS = False
+try:
+    from slidearabi.rtl_transforms import MasterLayoutTransformer, SlideContentTransformer
+    HAS_RTL_TRANSFORMS = True
+except ImportError as e:
+    logger.warning(f"RTL transforms not available: {e}")
+
+HAS_TYPOGRAPHY = False
+try:
+    from slidearabi.typography import TypographyNormalizer
+    HAS_TYPOGRAPHY = True
+except ImportError as e:
+    logger.warning(f"TypographyNormalizer not available: {e}")
+
+HAS_STRUCTURAL_VALIDATOR = False
+try:
+    from slidearabi.structural_validator import StructuralValidator
+    HAS_STRUCTURAL_VALIDATOR = True
+except ImportError as e:
+    logger.warning(f"StructuralValidator not available: {e}")
+
+try:
+    from slidearabi.models import ResolvedPresentation, ValidationReport  # noqa: F401
+except ImportError as e:
+    logger.warning(f"Models not available (non-critical): {e}")
+
+
+# ── PipelineConfig / PipelineResult — always available ──
+
+@dataclass
+class PipelineConfig:
+    input_path: str
+    output_path: str
+    translate_fn: Optional[Callable[[List[str]], Dict[str, str]]] = None
+    skip_translation: bool = False
+    max_font_reduction_pct: float = 20.0
+    log_level: str = 'INFO'
+    enable_telemetry: bool = False
+
+@dataclass
+class PipelineResult:
+    success: bool
+    output_path: Optional[str]
+    phase_reports: Dict[str, Any]
+    validation_report: Optional[Any]
+    total_duration_ms: float
+    error: Optional[str] = None
 
 # Phase 6 (VQA) and LLM translation — optional but wired when available
 try:
@@ -159,23 +194,17 @@ class SlideArabiPipeline:
         start_time = time.monotonic()
         logger.info("Phase 0: Resolving properties...")
         
-        try:
-            resolver = PropertyResolver(prs)
-            resolved_prs = resolver.resolve_presentation()
-            
-            # Optionally add layout analysis here if needed for phase 0 output
-            analyzer = LayoutAnalyzer()
-            # analyzer could mutate or wrap resolved_prs
-            
-            duration = (time.monotonic() - start_time) * 1000
-            self._log_phase('phase_0_resolve', duration, {"status": "success", "slides_resolved": len(prs.slides)})
-            return resolved_prs
-            
-        except NameError as e:
-            # Fallback if modules aren't available for tests
-            logger.warning(f"Phase 0 stubbed: {e}")
-            self._log_phase('phase_0_resolve', 0, {"status": "stubbed"})
+        if not HAS_PROPERTY_RESOLVER:
+            logger.warning("Phase 0 skipped: PropertyResolver not available")
+            self._log_phase('phase_0_resolve', 0, {"status": "module_unavailable"})
             return None
+
+        resolver = PropertyResolver(prs)
+        resolved_prs = resolver.resolve_presentation()
+        
+        duration = (time.monotonic() - start_time) * 1000
+        self._log_phase('phase_0_resolve', duration, {"status": "success", "slides_resolved": len(prs.slides)})
+        return resolved_prs
             
     def _phase_1_translate(self, resolved: Any) -> Dict[str, str]:
         """Phase 1: Extract text and call translation function."""
@@ -214,91 +243,119 @@ class SlideArabiPipeline:
         start_time = time.monotonic()
         logger.info("Phase 2: Transforming masters and layouts...")
         
-        try:
-            registry = TemplateRegistry()
-            transformer = MasterLayoutTransformer(prs, registry)
-            
-            transformer.transform_all_masters()
-            report = transformer.transform_all_layouts()
-            
-            duration = (time.monotonic() - start_time) * 1000
-            self._log_phase('phase_2_transform_masters', duration, {"status": "success"})
-            return report
-            
-        except NameError as e:
-            logger.warning(f"Phase 2 stubbed: {e}")
-            self._log_phase('phase_2_transform_masters', 0, {"status": "stubbed"})
+        if not (HAS_TEMPLATE_REGISTRY and HAS_RTL_TRANSFORMS):
+            logger.warning("Phase 2 skipped: TemplateRegistry or RTL transforms not available")
+            self._log_phase('phase_2_transform_masters', 0, {"status": "module_unavailable"})
             return None
+
+        registry = TemplateRegistry(prs.slide_width, prs.slide_height)
+        transformer = MasterLayoutTransformer(prs, registry)
+        
+        master_report = transformer.transform_all_masters()
+        layout_report = transformer.transform_all_layouts()
+        
+        duration = (time.monotonic() - start_time) * 1000
+        self._log_phase('phase_2_transform_masters', duration, {
+            "status": "success",
+            "master_changes": master_report.total_changes,
+            "layout_changes": layout_report.total_changes,
+        })
+        return layout_report
         
     def _phase_3_transform_slides(self, prs: Presentation, resolved: Any, translations: Dict[str, str]) -> Any:
         """Phase 3: Transform slide content deterministically."""
         start_time = time.monotonic()
         logger.info("Phase 3: Transforming slide content...")
         
-        try:
-            # Layout analyzer might be needed to get classifications
-            analyzer = LayoutAnalyzer()
-            layout_classifications = analyzer.classify_slides(prs)
-            
-            transformer = SlideContentTransformer(prs, layout_classifications, translations)
-            report = transformer.transform_all_slides()
-            
-            duration = (time.monotonic() - start_time) * 1000
-            self._log_phase('phase_3_transform_slides', duration, {"status": "success"})
-            return report
-            
-        except NameError as e:
-            logger.warning(f"Phase 3 stubbed: {e}")
-            self._log_phase('phase_3_transform_slides', 0, {"status": "stubbed"})
+        if not HAS_RTL_TRANSFORMS:
+            logger.warning("Phase 3 skipped: RTL transforms not available")
+            self._log_phase('phase_3_transform_slides', 0, {"status": "module_unavailable"})
             return None
+
+        # Layout analysis — get per-slide layout classifications
+        layout_classifications = {}
+        if HAS_LAYOUT_ANALYZER:
+            analyzer = LayoutAnalyzer(prs)
+            raw_classifications = analyzer.analyze_all()
+            # Convert LayoutClassification objects to simple type strings
+            layout_classifications = {
+                slide_num: cls.resolved_type
+                for slide_num, cls in raw_classifications.items()
+            }
+        else:
+            logger.warning("LayoutAnalyzer not available — proceeding without layout hints")
+
+        # Build TemplateRegistry if available (for rule-based transforms)
+        registry = None
+        if HAS_TEMPLATE_REGISTRY:
+            registry = TemplateRegistry(prs.slide_width, prs.slide_height)
+
+        transformer = SlideContentTransformer(
+            presentation=prs,
+            template_registry=registry,
+            layout_classifications=layout_classifications,
+            translations=translations,
+        )
+        report = transformer.transform_all_slides()
+        
+        duration = (time.monotonic() - start_time) * 1000
+        self._log_phase('phase_3_transform_slides', duration, {
+            "status": "success",
+            "total_changes": report.total_changes,
+        })
+        return report
         
     def _phase_4_typography(self, prs: Presentation) -> Any:
         """Phase 4: Normalize typography for Arabic."""
         start_time = time.monotonic()
         logger.info("Phase 4: Normalizing typography...")
         
-        try:
-            normalizer = TypographyNormalizer(prs, max_reduction_pct=self.config.max_font_reduction_pct)
-            report = normalizer.normalize_all()
-            
-            duration = (time.monotonic() - start_time) * 1000
-            self._log_phase('phase_4_typography', duration, {"status": "success"})
-            return report
-            
-        except NameError as e:
-            logger.warning(f"Phase 4 stubbed: {e}")
-            self._log_phase('phase_4_typography', 0, {"status": "stubbed"})
+        if not HAS_TYPOGRAPHY:
+            logger.warning("Phase 4 skipped: TypographyNormalizer not available")
+            self._log_phase('phase_4_typography', 0, {"status": "module_unavailable"})
             return None
+
+        normalizer = TypographyNormalizer(prs)
+        report = normalizer.normalize_all()
+        
+        duration = (time.monotonic() - start_time) * 1000
+        self._log_phase('phase_4_typography', duration, {
+            "status": "success",
+            "total_changes": report.total_changes,
+        })
+        return report
         
     def _phase_5_validate(self, prs: Presentation, resolved: Any) -> Any:
         """Phase 5: Read-only structural validation."""
         start_time = time.monotonic()
         logger.info("Phase 5: Structural validation...")
         
-        try:
-            validator = StructuralValidator(prs, resolved)
-            report = validator.validate()
-            
-            duration = (time.monotonic() - start_time) * 1000
-            
-            log_data = {
-                "status": "success",
-                "passed": report.passed,
-                "errors": report.errors,
-                "warnings": report.warnings
-            }
-            self._log_phase('phase_5_validate', duration, log_data)
-            
-            if not report.passed:
-                logger.warning(f"Validation failed with {report.errors} errors.")
-                # We don't fail the pipeline, just report it
-                
-            return report
-            
-        except NameError as e:
-            logger.warning(f"Phase 5 stubbed: {e}")
-            self._log_phase('phase_5_validate', 0, {"status": "stubbed"})
+        if not HAS_STRUCTURAL_VALIDATOR:
+            logger.warning("Phase 5 skipped: StructuralValidator not available")
+            self._log_phase('phase_5_validate', 0, {"status": "module_unavailable"})
             return None
+
+        validator = StructuralValidator(prs, resolved)
+        report = validator.validate()
+        
+        duration = (time.monotonic() - start_time) * 1000
+        
+        # NOTE: StructuralValidator.validate() returns structural_validator.ValidationReport
+        # which has .passed (bool), .errors (int), .warnings (int) — NOT models.ValidationReport.
+        log_data = {
+            "status": "success",
+            "passed": report.passed,
+            "errors": getattr(report, 'errors', 0),
+            "warnings": getattr(report, 'warnings', 0),
+        }
+        self._log_phase('phase_5_validate', duration, log_data)
+        
+        error_count = getattr(report, 'errors', 0)
+        if not report.passed:
+            logger.warning(f"Validation failed with {error_count} errors.")
+            # We don't fail the pipeline, just report it
+            
+        return report
         
     def _extract_texts(self, resolved: Any) -> List[str]:
         """Extract all translatable text strings from the resolved presentation."""
