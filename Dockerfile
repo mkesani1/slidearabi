@@ -11,9 +11,13 @@ RUN apt-get update && \
         libreoffice-common \
         poppler-utils \
         curl \
+        fontconfig \
         fonts-noto-core \
         fonts-noto-extra \
         fonts-noto-cjk \
+        fonts-hosny-amiri \
+        fonts-kacst \
+    && fc-cache -fv \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
