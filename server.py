@@ -1,8 +1,11 @@
 import base64
+import hashlib
 import json
 import logging
+import math
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -12,16 +15,19 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import stripe
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel
+from pptx import Presentation as PptxPresentation
 
 from slidearabi.llm_translator import DualLLMTranslator, TranslatorConfig
 from slidearabi.pipeline import PipelineConfig, SlideArabiPipeline
+import slidearabi.pipeline as pipeline_module
 
 
 logging.basicConfig(
@@ -68,6 +74,7 @@ class JobState:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     error: Optional[str] = None
     preview_slides: List[dict] = field(default_factory=list)
+    preview_origin: str = ""  # "output" or "fallback_input" — tracks which file the preview was rendered from
 
 
 JOBS: Dict[str, JobState] = {}
@@ -173,6 +180,70 @@ THUMB_WIDTH_PX = 800
 JPEG_QUALITY = 85
 LIBREOFFICE_TIMEOUT = 300
 PDFTOPPM_TIMEOUT = 120
+
+ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
+
+
+def _apply_watermark(
+    image_path: Path,
+    watermark_text: str = "SlideArabi Preview",
+) -> None:
+    """Apply a semi-transparent diagonal watermark to a JPEG preview thumbnail.
+
+    Uses Pillow to draw repeated diagonal text so the watermark is visible
+    regardless of slide content. Overwrites the original file in-place.
+    """
+    with Image.open(image_path) as base:
+        base = base.convert("RGBA")
+        width, height = base.size
+
+        txt_layer = Image.new("RGBA", base.size, (255, 255, 255, 0))
+        draw = ImageDraw.Draw(txt_layer)
+
+        # Dynamic font size: ~8% of image width
+        font_size = max(28, int(width * 0.08))
+
+        # Try several font paths (Docker / macOS / Linux fallbacks)
+        font = None
+        for font_path in [
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        ]:
+            try:
+                font = ImageFont.truetype(font_path, font_size)
+                break
+            except (IOError, OSError):
+                continue
+        if font is None:
+            font = ImageFont.load_default()
+
+        # Measure text
+        bbox = draw.textbbox((0, 0), watermark_text, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+
+        shadow_color = (0, 0, 0, 60)
+        text_color = (255, 255, 255, 100)
+
+        # Tile watermark text across the image in a grid pattern
+        spacing_x = text_w + int(width * 0.15)
+        spacing_y = text_h + int(height * 0.25)
+
+        for y in range(-height, height * 2, spacing_y):
+            for x in range(-width, width * 2, spacing_x):
+                draw.text((x + 2, y + 2), watermark_text, font=font, fill=shadow_color)
+                draw.text((x, y), watermark_text, font=font, fill=text_color)
+
+        # Rotate the text layer for diagonal effect
+        watermark_layer = txt_layer.rotate(
+            30, resample=Image.BICUBIC, expand=False,
+            center=(width // 2, height // 2),
+        )
+
+        watermarked = Image.alpha_composite(base, watermark_layer)
+        final = watermarked.convert("RGB")
+        final.save(str(image_path), "JPEG", quality=JPEG_QUALITY)
 
 
 def _natural_sort_key(path: Path) -> int:
@@ -288,14 +359,21 @@ def _render_preview_slides(
                 f"pdftoppm failed: {exc.stderr.decode(errors='replace')}"
             )
 
-    # ── Step 3: Collect thumbnails and encode as base64 data URIs ─────
+    # ── Step 3: Apply watermark + collect as base64 data URIs ─────────
     generated = sorted(preview_dir.glob("slide-*.jpg"), key=_natural_sort_key)
 
     if not generated:
         logger.warning("No slide thumbnails were generated in %s", preview_dir)
         return []
 
-    logger.info("Generated %d slide thumbnails", len(generated))
+    logger.info("Generated %d slide thumbnails — applying watermarks", len(generated))
+
+    # Apply watermark to every preview thumbnail
+    for img_path in generated:
+        try:
+            _apply_watermark(img_path)
+        except Exception as wm_exc:
+            logger.warning("Watermark failed for %s: %s", img_path, wm_exc)
 
     previews: List[dict] = []
     for idx, img_path in enumerate(generated[:max_slides]):
@@ -346,6 +424,25 @@ def _set_job_state(job_id: str, **kwargs) -> None:
             setattr(job, k, v)
 
 
+def _write_preview_debug(
+    job_dir: Path, job_id: str, source_pptx: str, origin: str,
+) -> None:
+    """Write a tiny sidecar JSON so /debug/{job_id} can prove which file the preview used."""
+    try:
+        data = {
+            "job_id": job_id,
+            "source_pptx": source_pptx,
+            "origin": origin,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        (job_dir / "preview_debug.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        logger.warning("Failed to write preview_debug.json: %s", exc)
+
+
 def _run_pipeline_worker(job_id: str) -> None:
     acquired = PIPELINE_SEMAPHORE.acquire(blocking=False)
     if not acquired:
@@ -394,6 +491,16 @@ def _run_pipeline_worker(job_id: str) -> None:
             )
             raise RuntimeError(error_msg)
 
+        # Persist phase reports for diagnostic endpoint
+        try:
+            phase_report_path = output_path.parent / "pipeline_phase_reports.json"
+            phase_report_path.write_text(
+                json.dumps(result.phase_reports or {}, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+        except Exception as pr_exc:
+            logger.warning("Failed to persist phase reports: %s", pr_exc)
+
         _set_job_state(job_id, current_phase=PHASE_RTL, progress_pct=70)
         _set_job_state(job_id, current_phase=PHASE_QC, progress_pct=90)
 
@@ -419,7 +526,12 @@ def _run_pipeline_worker(job_id: str) -> None:
             )
             if not preview_slides:
                 raise RuntimeError("_render_preview_slides returned empty list")
-            _set_job_state(job_id, preview_slides=preview_slides)
+            _set_job_state(job_id, preview_slides=preview_slides, preview_origin="output")
+            # Write preview sidecar metadata for diagnostics
+            _write_preview_debug(
+                output_path.parent, job_id,
+                source_pptx=str(output_path), origin="output",
+            )
             logger.info(
                 "Arabic preview generated for job %s (%d slides)",
                 job_id,
@@ -438,7 +550,11 @@ def _run_pipeline_worker(job_id: str) -> None:
                 preview_slides = _render_preview_slides(
                     input_path, fallback_dir, max_slides=50
                 )
-                _set_job_state(job_id, preview_slides=preview_slides)
+                _set_job_state(job_id, preview_slides=preview_slides, preview_origin="fallback_input")
+                _write_preview_debug(
+                    input_path.parent, job_id,
+                    source_pptx=str(input_path), origin="fallback_input",
+                )
                 logger.warning(
                     "ENGLISH FALLBACK preview generated for job %s (%d slides)",
                     job_id,
@@ -752,7 +868,249 @@ def apply_promo(payload: PromoCodeRequest):
 @app.get("/health")
 def health():
     try:
-        return {"status": "ok", "version": "1.0.0"}
+        return {"status": "ok", "version": "1.1.0"}
     except Exception as exc:
         logger.exception("/health failed: %s", exc)
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEMPORARY DEBUG ENDPOINTS  — remove after root cause is confirmed
+# Gated by SLIDEARABI_DEBUG_TOKEN env var (fail-closed: 403 if unset)
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEBUG_TOKEN = os.getenv("SLIDEARABI_DEBUG_TOKEN", "")
+
+
+def _require_debug_auth(token: str) -> None:
+    """Validate debug token. 403 if unset or mismatched."""
+    if not DEBUG_TOKEN or not secrets.compare_digest(token, DEBUG_TOKEN):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+def _sha256_file(path: Path) -> Optional[str]:
+    """SHA-256 hash of a file, or None if it doesn't exist."""
+    if not path.exists():
+        return None
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _count_arabic_chars_in_pptx(pptx_path: Path) -> Dict[str, Any]:
+    """Scan a PPTX for Arabic script evidence. Returns a diagnostic dict."""
+    stats: Dict[str, Any] = {
+        "slides": 0,
+        "text_shapes": 0,
+        "nonempty_paragraphs": 0,
+        "paragraphs_with_arabic": 0,
+        "arabic_char_count": 0,
+        "sample_arabic": [],
+        "sample_english": [],
+    }
+    try:
+        prs = PptxPresentation(str(pptx_path))
+        stats["slides"] = len(prs.slides)
+        for slide in prs.slides:
+            for shape in slide.shapes:
+                if not (getattr(shape, "has_text_frame", False) and shape.has_text_frame):
+                    continue
+                stats["text_shapes"] += 1
+                for para in shape.text_frame.paragraphs:
+                    txt = (para.text or "").strip()
+                    if not txt:
+                        continue
+                    stats["nonempty_paragraphs"] += 1
+                    matches = ARABIC_RE.findall(txt)
+                    if matches:
+                        stats["paragraphs_with_arabic"] += 1
+                        stats["arabic_char_count"] += len(matches)
+                        if len(stats["sample_arabic"]) < 5:
+                            stats["sample_arabic"].append(txt[:180])
+                    else:
+                        if len(stats["sample_english"]) < 5:
+                            stats["sample_english"].append(txt[:180])
+    except Exception as exc:
+        stats["error"] = str(exc)
+    return stats
+
+
+@app.get("/debug/imports")
+def debug_imports(token: str = ""):
+    """Check which pipeline modules loaded and what system tools are available."""
+    _require_debug_auth(token)
+    try:
+        flags = {
+            "HAS_PROPERTY_RESOLVER": pipeline_module.HAS_PROPERTY_RESOLVER,
+            "HAS_LAYOUT_ANALYZER": pipeline_module.HAS_LAYOUT_ANALYZER,
+            "HAS_TEMPLATE_REGISTRY": pipeline_module.HAS_TEMPLATE_REGISTRY,
+            "HAS_RTL_TRANSFORMS": pipeline_module.HAS_RTL_TRANSFORMS,
+            "HAS_TYPOGRAPHY": pipeline_module.HAS_TYPOGRAPHY,
+            "HAS_STRUCTURAL_VALIDATOR": pipeline_module.HAS_STRUCTURAL_VALIDATOR,
+            "HAS_VQA": getattr(pipeline_module, "HAS_VQA", False),
+            "HAS_LLM_TRANSLATOR": getattr(pipeline_module, "HAS_LLM_TRANSLATOR", False),
+        }
+
+        def _check_cmd(cmd: List[str]) -> Dict[str, Any]:
+            exe = shutil.which(cmd[0])
+            if not exe:
+                return {"installed": False, "path": None}
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                return {"installed": True, "path": exe, "stdout": proc.stdout.strip()[:200]}
+            except Exception as e:
+                return {"installed": True, "path": exe, "error": str(e)}
+
+        # Arabic fonts check
+        arabic_fonts_raw = _check_cmd(["fc-list", ":lang=ar", "family"])
+        arabic_font_lines = [
+            line.strip()
+            for line in arabic_fonts_raw.get("stdout", "").splitlines()
+            if line.strip()
+        ]
+
+        return {
+            "debug": True,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "import_flags": flags,
+            "system_tools": {
+                "libreoffice": _check_cmd(["libreoffice", "--version"]),
+                "pdftoppm": _check_cmd(["pdftoppm", "-v"]),
+            },
+            "arabic_fonts": {
+                "count": len(arabic_font_lines),
+                "families": arabic_font_lines[:50],
+            },
+            "env": {
+                "OPENAI_API_KEY_set": bool(os.getenv("OPENAI_API_KEY")),
+                "ANTHROPIC_API_KEY_set": bool(os.getenv("ANTHROPIC_API_KEY")),
+            },
+            "interpretation": {
+                "likely_phase0_failure": not pipeline_module.HAS_PROPERTY_RESOLVER,
+                "likely_translation_disabled": not getattr(pipeline_module, "HAS_LLM_TRANSLATOR", False),
+            },
+        }
+    except Exception as exc:
+        logger.exception("/debug/imports failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"debug failed: {exc}")
+
+
+@app.get("/debug/{job_id}")
+def debug_job(job_id: str, token: str = ""):
+    """Comprehensive diagnostic for a specific job.
+
+    Reveals: module flags, file hashes, Arabic text scan, translation probe,
+    preview source metadata, and phase reports.  Read-only — safe to hit
+    repeatedly without side effects.
+    """
+    _require_debug_auth(token)
+    try:
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if not job:
+                raise HTTPException(status_code=404, detail="Job not found")
+
+        input_path = Path(job.input_path)
+        output_path = Path(job.output_path)
+
+        # File metadata + hashing
+        in_hash = _sha256_file(input_path)
+        out_hash = _sha256_file(output_path)
+
+        files = {
+            "input_exists": input_path.exists(),
+            "output_exists": output_path.exists(),
+            "input_size": input_path.stat().st_size if input_path.exists() else 0,
+            "output_size": output_path.stat().st_size if output_path.exists() else 0,
+            "input_sha256": in_hash,
+            "output_sha256": out_hash,
+            "files_identical": (in_hash == out_hash) if (in_hash and out_hash) else None,
+        }
+
+        # Scan both files for Arabic text
+        text_scan = {
+            "input": _count_arabic_chars_in_pptx(input_path) if input_path.exists() else None,
+            "output": _count_arabic_chars_in_pptx(output_path) if output_path.exists() else None,
+        }
+
+        # Module flags
+        module_flags = {
+            "HAS_PROPERTY_RESOLVER": pipeline_module.HAS_PROPERTY_RESOLVER,
+            "HAS_LAYOUT_ANALYZER": pipeline_module.HAS_LAYOUT_ANALYZER,
+            "HAS_TEMPLATE_REGISTRY": pipeline_module.HAS_TEMPLATE_REGISTRY,
+            "HAS_RTL_TRANSFORMS": pipeline_module.HAS_RTL_TRANSFORMS,
+            "HAS_TYPOGRAPHY": pipeline_module.HAS_TYPOGRAPHY,
+            "HAS_STRUCTURAL_VALIDATOR": pipeline_module.HAS_STRUCTURAL_VALIDATOR,
+            "HAS_VQA": getattr(pipeline_module, "HAS_VQA", False),
+            "HAS_LLM_TRANSLATOR": getattr(pipeline_module, "HAS_LLM_TRANSLATOR", False),
+        }
+
+        # Phase reports (persisted by worker)
+        phase_reports = {}
+        phase_report_path = output_path.parent / "pipeline_phase_reports.json"
+        if phase_report_path.exists():
+            try:
+                phase_reports = json.loads(phase_report_path.read_text(encoding="utf-8"))
+            except Exception:
+                phase_reports = {"error": "Failed reading pipeline_phase_reports.json"}
+
+        # Preview sidecar
+        preview_debug = {}
+        preview_debug_path = output_path.parent / "preview_debug.json"
+        if not preview_debug_path.exists():
+            preview_debug_path = input_path.parent / "preview_debug.json"
+        if preview_debug_path.exists():
+            try:
+                preview_debug = json.loads(preview_debug_path.read_text(encoding="utf-8"))
+            except Exception:
+                preview_debug = {"error": "Failed reading preview_debug.json"}
+
+        preview_info = {
+            "preview_slides_count": len(job.preview_slides or []),
+            "preview_origin": job.preview_origin or "unknown",
+            "sidecar_metadata": preview_debug,
+        }
+
+        # Diagnosis summary
+        diagnosis: List[str] = []
+        if files["files_identical"]:
+            diagnosis.append("OUTPUT_IDENTICAL_TO_INPUT — pipeline was a no-op")
+        if text_scan.get("output") and text_scan["output"].get("arabic_char_count", 0) == 0:
+            diagnosis.append("NO_ARABIC_IN_OUTPUT — translation/apply failed")
+        if text_scan.get("output") and text_scan["output"].get("arabic_char_count", 0) > 0:
+            diagnosis.append("ARABIC_PRESENT_IN_OUTPUT — translation succeeded")
+        if not module_flags["HAS_PROPERTY_RESOLVER"]:
+            diagnosis.append("PROPERTY_RESOLVER_DISABLED — Phase 0 would skip")
+        if not module_flags["HAS_RTL_TRANSFORMS"]:
+            diagnosis.append("RTL_TRANSFORMS_DISABLED — Phase 3 would skip")
+        if job.preview_origin == "fallback_input":
+            diagnosis.append("PREVIEW_FROM_ENGLISH_FALLBACK")
+
+        return {
+            "debug": True,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "job": {
+                "job_id": job.job_id,
+                "status": job.status,
+                "progress_pct": job.progress_pct,
+                "current_phase": job.current_phase,
+                "error": job.error,
+                "total_slides": job.total_slides,
+            },
+            "module_flags": module_flags,
+            "files": files,
+            "text_scan": text_scan,
+            "preview": preview_info,
+            "phase_reports": phase_reports,
+            "env": {
+                "OPENAI_API_KEY_set": bool(os.getenv("OPENAI_API_KEY")),
+                "ANTHROPIC_API_KEY_set": bool(os.getenv("ANTHROPIC_API_KEY")),
+            },
+            "diagnosis": diagnosis,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("/debug/job failed for %s: %s", job_id, exc)
+        raise HTTPException(status_code=500, detail=f"debug failed: {exc}")
