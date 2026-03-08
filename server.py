@@ -2,8 +2,10 @@ import base64
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -164,36 +166,149 @@ def _count_slides(pptx_path: Path) -> int:
         raise HTTPException(status_code=400, detail="Unable to read PPTX slide structure")
 
 
-def _render_preview_slides(input_path: Path, preview_dir: Path, max_slides: int = 50) -> List[dict]:
-    """Render PPTX slides to JPEG thumbnails via LibreOffice.
+# ---------------------------------------------------------------------------
+# Preview rendering constants
+# ---------------------------------------------------------------------------
+THUMB_WIDTH_PX = 800
+JPEG_QUALITY = 85
+LIBREOFFICE_TIMEOUT = 300
+PDFTOPPM_TIMEOUT = 120
+
+
+def _natural_sort_key(path: Path) -> int:
+    """Extract trailing integer from filename for natural sort order."""
+    match = re.search(r"(\d+)\.\w+$", path.name)
+    return int(match.group(1)) if match else 0
+
+
+def _render_preview_slides(
+    input_path: Path,
+    preview_dir: Path,
+    max_slides: int = 100,
+    thumb_width: int = THUMB_WIDTH_PX,
+) -> List[dict]:
+    """Render individual slide thumbnails from a PPTX file.
+
+    Pipeline:
+        1. LibreOffice converts PPTX → PDF (one page per slide)
+        2. pdftoppm converts each PDF page → JPEG thumbnail
 
     Returns a list of dicts matching the frontend PreviewSlide interface:
         { index: int, image_url: str, title: str }
     """
     preview_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "libreoffice",
-        "--headless",
-        "--convert-to",
-        "jpg",
-        "--outdir",
-        str(preview_dir),
-        str(input_path),
-    ]
-    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
 
-    generated = sorted(preview_dir.glob("*.jpg"))
-    previews = []
+    # ── Step 1: PPTX → PDF via LibreOffice ────────────────────────────
+    with tempfile.TemporaryDirectory(prefix="pptx_pdf_") as tmp_dir:
+        pdf_out_dir = Path(tmp_dir)
+
+        cmd_pdf = [
+            "libreoffice",
+            "--headless",
+            "--norestore",
+            "--convert-to", "pdf",
+            "--outdir", str(pdf_out_dir),
+            str(input_path),
+        ]
+
+        logger.info("Converting PPTX to PDF: %s", " ".join(cmd_pdf))
+        try:
+            subprocess.run(
+                cmd_pdf,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=LIBREOFFICE_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("LibreOffice timed out after %ds", LIBREOFFICE_TIMEOUT)
+            raise RuntimeError(
+                f"LibreOffice PDF conversion timed out after {LIBREOFFICE_TIMEOUT}s"
+            )
+        except subprocess.CalledProcessError as exc:
+            logger.error(
+                "LibreOffice failed (rc=%d): %s",
+                exc.returncode,
+                exc.stderr.decode(errors="replace"),
+            )
+            raise RuntimeError(
+                f"LibreOffice PDF conversion failed: {exc.stderr.decode(errors='replace')}"
+            )
+
+        # LibreOffice names the output <stem>.pdf in --outdir
+        pdf_path = pdf_out_dir / f"{input_path.stem}.pdf"
+        if not pdf_path.exists():
+            pdfs = list(pdf_out_dir.glob("*.pdf"))
+            if not pdfs:
+                raise FileNotFoundError(
+                    f"LibreOffice did not produce a PDF in {pdf_out_dir}"
+                )
+            pdf_path = pdfs[0]
+            logger.warning("Expected PDF name mismatch; using %s", pdf_path.name)
+
+        logger.info("PDF created: %s (%d bytes)", pdf_path, pdf_path.stat().st_size)
+
+        # ── Step 2: PDF → per-page JPEGs via pdftoppm ────────────────
+        output_prefix = str(preview_dir / "slide")
+
+        cmd_jpg = [
+            "pdftoppm",
+            "-jpeg",
+            "-jpegopt", f"quality={JPEG_QUALITY}",
+            "-scale-to-x", str(thumb_width),
+            "-scale-to-y", "-1",
+        ]
+
+        if max_slides and max_slides > 0:
+            cmd_jpg += ["-l", str(max_slides)]
+
+        cmd_jpg += [str(pdf_path), output_prefix]
+
+        logger.info("Rendering slide thumbnails: %s", " ".join(cmd_jpg))
+        try:
+            subprocess.run(
+                cmd_jpg,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=PDFTOPPM_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("pdftoppm timed out after %ds", PDFTOPPM_TIMEOUT)
+            raise RuntimeError(
+                f"pdftoppm timed out after {PDFTOPPM_TIMEOUT}s"
+            )
+        except subprocess.CalledProcessError as exc:
+            logger.error(
+                "pdftoppm failed (rc=%d): %s",
+                exc.returncode,
+                exc.stderr.decode(errors="replace"),
+            )
+            raise RuntimeError(
+                f"pdftoppm failed: {exc.stderr.decode(errors='replace')}"
+            )
+
+    # ── Step 3: Collect thumbnails and encode as base64 data URIs ─────
+    generated = sorted(preview_dir.glob("slide-*.jpg"), key=_natural_sort_key)
+
+    if not generated:
+        logger.warning("No slide thumbnails were generated in %s", preview_dir)
+        return []
+
+    logger.info("Generated %d slide thumbnails", len(generated))
+
+    previews: List[dict] = []
     for idx, img_path in enumerate(generated[:max_slides]):
         with open(img_path, "rb") as f:
             encoded = base64.b64encode(f.read()).decode("ascii")
         previews.append(
             {
-                "index": idx,  # 0-based to match frontend PreviewSlide.index
+                "index": idx,
                 "image_url": f"data:image/jpeg;base64,{encoded}",
                 "title": f"Slide {idx + 1}",
             }
         )
+
     return previews
 
 
@@ -257,7 +372,7 @@ def _run_pipeline_worker(job_id: str) -> None:
         # Generate preview slides in the worker (moved from /convert for fast HTTP response)
         preview_dir = input_path.parent / "preview"
         try:
-            preview_slides = _render_preview_slides(input_path, preview_dir, max_slides=3)
+            preview_slides = _render_preview_slides(input_path, preview_dir, max_slides=50)
             _set_job_state(job_id, preview_slides=preview_slides)
             logger.info("Preview generated for job %s (%d slides)", job_id, len(preview_slides))
         except Exception as exc:
