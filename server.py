@@ -80,10 +80,12 @@ app.add_middleware(
         "https://slidearabi.com",
         "https://www.slidearabi.com",
         "http://localhost:3000",
-        "*",  # TODO: remove wildcard once frontend is on slidearabi.com
     ],
-    allow_methods=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS", "DELETE", "PUT"],
     allow_headers=["*"],
+    expose_headers=["Content-Length", "Content-Type"],
+    max_age=3600,
 )
 
 
@@ -216,6 +218,17 @@ def _run_pipeline_worker(job_id: str) -> None:
         input_path = Path(job.input_path)
         output_path = Path(job.output_path)
 
+        # Generate preview slides in the worker (moved from /convert for fast HTTP response)
+        preview_dir = input_path.parent / "preview"
+        try:
+            preview_slides = _render_preview_slides(input_path, preview_dir, max_slides=3)
+            _set_job_state(job_id, preview_slides=preview_slides)
+            logger.info("Preview generated for job %s (%d slides)", job_id, len(preview_slides))
+        except Exception as exc:
+            logger.warning("Preview generation failed for %s: %s", job_id, exc)
+
+        _set_job_state(job_id, progress_pct=10)
+
         translate_fn = _build_translate_fn()
         cfg = PipelineConfig(
             input_path=str(input_path),
@@ -280,14 +293,13 @@ async def convert(file: UploadFile = File(...)):
 
         content = await file.read()
         if len(content) > MAX_FILE_SIZE:
-            raise HTTPException(status_code=413, detail="File too large (max 50MB)")
+            raise HTTPException(status_code=413, detail="File too large (max 150MB)")
 
         if PIPELINE_SEMAPHORE._value <= 0:  # best-effort guard before queueing
             raise HTTPException(status_code=503, detail="Server busy", headers={"Retry-After": "30"})
 
         job_id = str(uuid.uuid4())
         job_dir = BASE_DIR / job_id
-        preview_dir = job_dir / "preview"
         job_dir.mkdir(parents=True, exist_ok=True)
 
         input_path = job_dir / "input.pptx"
@@ -297,12 +309,8 @@ async def convert(file: UploadFile = File(...)):
 
         slide_count = _count_slides(input_path)
 
-        preview_slides = []
-        try:
-            preview_slides = _render_preview_slides(input_path, preview_dir, max_slides=3)
-        except Exception as exc:
-            logger.warning("Preview generation failed for %s: %s", job_id, exc)
-
+        # Do NOT block on LibreOffice preview here — respond immediately.
+        # Preview generation happens in the background pipeline worker.
         job = JobState(
             job_id=job_id,
             status="queued",
@@ -312,7 +320,7 @@ async def convert(file: UploadFile = File(...)):
             output_path=str(output_path),
             total_slides=slide_count,
             paid=False,
-            preview_slides=preview_slides,
+            preview_slides=[],
         )
 
         with JOBS_LOCK:
@@ -321,7 +329,7 @@ async def convert(file: UploadFile = File(...)):
         # Start immediately for MVP flow (can be gated by payment later via verify-payment)
         _start_pipeline_if_allowed(job_id)
 
-        return {"job_id": job_id, "status": "queued", "slide_count": slide_count}
+        return {"job_id": job_id, "status": "queued", "slide_count": slide_count, "total_slides": slide_count}
     except HTTPException:
         raise
     except Exception as exc:
