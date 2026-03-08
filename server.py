@@ -81,6 +81,19 @@ class VerifyPaymentRequest(BaseModel):
     job_id: str
 
 
+class PromoCodeRequest(BaseModel):
+    job_id: str
+    code: str
+
+
+# ── Valid promo codes that bypass Stripe payment ──
+VALID_PROMO_CODES: Dict[str, str] = {
+    "SLIDETEST2026": "Internal testing",
+    "FOUNDER": "Founder access",
+    "DEMO": "Demo / sales",
+}
+
+
 app = FastAPI(title="SlideArabi API", version="1.0.0")
 
 app.add_middleware(
@@ -151,7 +164,12 @@ def _count_slides(pptx_path: Path) -> int:
         raise HTTPException(status_code=400, detail="Unable to read PPTX slide structure")
 
 
-def _render_preview_slides(input_path: Path, preview_dir: Path, max_slides: int = 3) -> List[dict]:
+def _render_preview_slides(input_path: Path, preview_dir: Path, max_slides: int = 50) -> List[dict]:
+    """Render PPTX slides to JPEG thumbnails via LibreOffice.
+
+    Returns a list of dicts matching the frontend PreviewSlide interface:
+        { index: int, image_url: str, title: str }
+    """
     preview_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         "libreoffice",
@@ -166,13 +184,14 @@ def _render_preview_slides(input_path: Path, preview_dir: Path, max_slides: int 
 
     generated = sorted(preview_dir.glob("*.jpg"))
     previews = []
-    for idx, img_path in enumerate(generated[:max_slides], start=1):
+    for idx, img_path in enumerate(generated[:max_slides]):
         with open(img_path, "rb") as f:
             encoded = base64.b64encode(f.read()).decode("ascii")
         previews.append(
             {
-                "slide_num": idx,
+                "index": idx,  # 0-based to match frontend PreviewSlide.index
                 "image_url": f"data:image/jpeg;base64,{encoded}",
+                "title": f"Slide {idx + 1}",
             }
         )
     return previews
@@ -542,6 +561,32 @@ def verify_payment(payload: VerifyPaymentRequest):
         raise
     except Exception as exc:
         logger.exception("/verify-payment failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.post("/apply-promo")
+def apply_promo(payload: PromoCodeRequest):
+    """Validate a promo code and mark the job as paid (bypasses Stripe)."""
+    try:
+        code = payload.code.strip().upper()
+        if code not in VALID_PROMO_CODES:
+            raise HTTPException(status_code=400, detail="Invalid promo code")
+
+        with JOBS_LOCK:
+            job = JOBS.get(payload.job_id)
+            if not job:
+                raise HTTPException(status_code=404, detail="Job not found")
+            if job.status != "completed":
+                raise HTTPException(status_code=400, detail="Job is not ready for download")
+
+        _set_job_state(payload.job_id, paid=True)
+        logger.info("Promo code %s applied to job %s (%s)", code, payload.job_id, VALID_PROMO_CODES[code])
+
+        return {"success": True, "message": f"Promo code applied. You can now download your file."}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("/apply-promo failed: %s", exc)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
