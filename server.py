@@ -369,17 +369,9 @@ def _run_pipeline_worker(job_id: str) -> None:
         input_path = Path(job.input_path)
         output_path = Path(job.output_path)
 
-        # Generate preview slides in the worker (moved from /convert for fast HTTP response)
-        preview_dir = input_path.parent / "preview"
-        try:
-            preview_slides = _render_preview_slides(input_path, preview_dir, max_slides=50)
-            _set_job_state(job_id, preview_slides=preview_slides)
-            logger.info("Preview generated for job %s (%d slides)", job_id, len(preview_slides))
-        except Exception as exc:
-            logger.warning("Preview generation failed for %s: %s", job_id, exc)
-
         _set_job_state(job_id, progress_pct=10)
 
+        # ── Translation pipeline ──────────────────────────────────────
         translate_fn = _build_translate_fn()
         cfg = PipelineConfig(
             input_path=str(input_path),
@@ -407,6 +399,41 @@ def _run_pipeline_worker(job_id: str) -> None:
 
         if not output_path.exists():
             raise RuntimeError("Pipeline reported success but output file missing")
+
+        # ── Preview from TRANSLATED Arabic output ─────────────────────
+        preview_dir = output_path.parent / "preview"
+        try:
+            preview_slides = _render_preview_slides(
+                output_path, preview_dir, max_slides=50
+            )
+            _set_job_state(job_id, preview_slides=preview_slides)
+            logger.info(
+                "Arabic preview generated for job %s (%d slides)",
+                job_id,
+                len(preview_slides),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Arabic preview failed for %s: %s — falling back to English",
+                job_id,
+                exc,
+            )
+            # Fallback: render from original English so user sees *something*
+            try:
+                fallback_dir = input_path.parent / "preview_fallback"
+                preview_slides = _render_preview_slides(
+                    input_path, fallback_dir, max_slides=50
+                )
+                _set_job_state(job_id, preview_slides=preview_slides)
+                logger.info(
+                    "Fallback (English) preview generated for job %s", job_id
+                )
+            except Exception as fallback_exc:
+                logger.warning(
+                    "Fallback preview also failed for %s: %s",
+                    job_id,
+                    fallback_exc,
+                )
 
         _set_job_state(
             job_id,
