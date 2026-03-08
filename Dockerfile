@@ -2,11 +2,14 @@
 # ──────────────────────────────────────
 FROM python:3.12-slim
 
-# Install LibreOffice (headless) for slide preview rendering + curl for API calls
+# Install LibreOffice (headless) for slide preview rendering,
+# poppler-utils (pdftoppm) for per-page PDF→JPEG extraction,
+# curl for health checks / geo-pricing lookups.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libreoffice-impress \
         libreoffice-common \
+        poppler-utils \
         curl \
         fonts-noto-core \
         fonts-noto-extra \
