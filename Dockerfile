@@ -37,9 +37,6 @@ RUN mkdir -p /tmp/slideshift_jobs
 # Expose port (Railway injects $PORT)
 EXPOSE 8000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s \
-    CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
-
+# Railway handles health checks via railway.toml — no Docker HEALTHCHECK needed
 # Run with uvicorn; Railway sets PORT env var
 CMD ["sh", "-c", "uvicorn slidearabi.server:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
