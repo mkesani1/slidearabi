@@ -108,7 +108,7 @@ VALID_PROMO_CODES: Dict[str, str] = {
 }
 
 
-app = FastAPI(title="SlideArabi API", version="1.1.0")
+app = FastAPI(title="SlideArabi API", version="1.1.1")
 
 
 # === STARTUP DIAGNOSTIC — remove after Railway deploy is stable ===
@@ -886,7 +886,7 @@ def apply_promo(payload: PromoCodeRequest):
 @app.get("/health")
 def health():
     try:
-        return {"status": "ok", "version": "1.1.0"}
+        return {"status": "ok", "version": "1.1.1"}
     except Exception as exc:
         logger.exception("/health failed: %s", exc)
         raise HTTPException(status_code=500, detail="Internal server error")
