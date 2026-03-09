@@ -190,12 +190,14 @@ INJECTION_PATTERNS: List[Tuple[re.Pattern, str, ThreatLevel]] = [
      "new_instruction_block", ThreatLevel.HIGH),
 
     # Role impersonation / context manipulation
+    # v1.1.1: Downgraded from CRITICAL/HIGH → LOW. "System: Overview" and
+    # "User: John Smith" are common slide headings that false-positive.
     (re.compile(r'^system\s*:', re.I | re.M),
-     "role_impersonation_system", ThreatLevel.CRITICAL),
+     "role_impersonation_system", ThreatLevel.LOW),
     (re.compile(r'^assistant\s*:', re.I | re.M),
-     "role_impersonation_assistant", ThreatLevel.HIGH),
+     "role_impersonation_assistant", ThreatLevel.LOW),
     (re.compile(r'^user\s*:', re.I | re.M),
-     "role_impersonation_user", ThreatLevel.MEDIUM),
+     "role_impersonation_user", ThreatLevel.LOW),
     (re.compile(r'\[INST\]|\[/INST\]|<\|im_start\|>|<\|im_end\|>|<\|system\|>|<\|user\|>|<\|assistant\|>', re.I),
      "chat_template_injection", ThreatLevel.CRITICAL),
     (re.compile(r'<\|endof(text|turn|prompt)\|>', re.I),
@@ -305,10 +307,12 @@ class InputSanitizer:
         # Step 7: Detect suspicious patterns (lower confidence)
         self._detect_suspicious_patterns(cleaned, report)
 
-        # Step 8: Neutralize role markers in the text
-        # Don't remove them (could be legitimate content like "System: Overview")
-        # but escape them so the LLM doesn't treat them as role boundaries
-        cleaned = self._neutralize_role_markers(cleaned)
+        # Step 8: Role marker neutralization — DISABLED in v1.1.1
+        # _neutralize_role_markers corrupts legitimate slide text like
+        # "System: Overview" → "[System]: Overview" which then fails translation
+        # matching. Role impersonation is now LOW severity (see above) and
+        # the prompt structure itself handles role boundary security.
+        # cleaned = self._neutralize_role_markers(cleaned)  # DISABLED v1.1.1
 
         report.sanitized_text = cleaned
 

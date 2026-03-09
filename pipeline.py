@@ -159,32 +159,46 @@ class SlideArabiPipeline:
             # before saving. If translation_map had entries but no Arabic
             # text ended up in the presentation, something went wrong in
             # Phase 3's apply logic.
+            # v1.1.1: Enhanced post-transform check — verify Arabic RATIO, not just existence.
+            # A single cached Arabic string shouldn't mask 8 untranslated English slides.
             if not self.config.skip_translation and translation_map:
-                arabic_found = False
+                arabic_text_count = 0
+                total_text_count = 0
                 sample_texts = []
                 for slide in prs.slides:
                     for shape in slide.shapes:
                         if hasattr(shape, 'has_text_frame') and shape.has_text_frame:
                             for para in shape.text_frame.paragraphs:
                                 text = para.text.strip()
-                                if text:
-                                    sample_texts.append(text[:80])
+                                if text and len(text) > 3:
+                                    total_text_count += 1
                                     if _ARABIC_RE.search(text):
-                                        arabic_found = True
-                                        break
-                        if arabic_found:
-                            break
-                    if arabic_found:
-                        break
+                                        arabic_text_count += 1
+                                    elif len(sample_texts) < 10:
+                                        sample_texts.append(text[:80])
                 
-                if not arabic_found:
+                if total_text_count == 0:
+                    logger.warning("Post-transform: no text found in output (empty presentation?)")
+                elif arabic_text_count == 0:
                     raise RuntimeError(
                         "FATAL: Post-transform verification failed. "
                         f"Translation map has {len(translation_map)} entries but "
                         "NO Arabic text found in output presentation. "
-                        f"Sample texts from output: {sample_texts[:5]}"
+                        f"Sample non-Arabic texts: {sample_texts[:5]}"
                     )
-                logger.info("Post-transform verification PASSED: Arabic text confirmed in output")
+                else:
+                    arabic_ratio = arabic_text_count / total_text_count
+                    logger.info(
+                        "Post-transform verification: %d/%d text frames Arabic (%.1f%%)",
+                        arabic_text_count, total_text_count, arabic_ratio * 100
+                    )
+                    if arabic_ratio < 0.3:
+                        # Less than 30% Arabic is a warning — translation partially failed
+                        logger.warning(
+                            "Post-transform WARNING: Only %.1f%% Arabic coverage. "
+                            "Expected >50%%. Non-Arabic samples: %s",
+                            arabic_ratio * 100, sample_texts[:5]
+                        )
             
             # Phase 4: Typography Normalization
             p4_report = self._phase_4_typography(prs)

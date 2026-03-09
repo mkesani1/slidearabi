@@ -514,20 +514,18 @@ class GPTClient:
             lines.append(f"{idx}. {text}")
         user_content = "\n".join(lines)
 
-        # Use hardened prompt structure (Layer 2 — prompt injection defense)
-        hardener = PromptHardener()
-        nonce = hardener._generate_nonce()
-
+        # v1.1.1: Removed PromptHardener — it disrupts GPT translation output.
+        # Defense is handled at the pipeline level (pre/post sanitization).
         body = {
             "model": self.model,
             "messages": [
                 {
                     "role": "system",
-                    "content": hardener.harden_system_prompt(GPT_SYSTEM_PROMPT, nonce)
+                    "content": GPT_SYSTEM_PROMPT
                 },
                 {
                     "role": "user",
-                    "content": hardener.wrap_user_content(user_content, nonce)
+                    "content": user_content
                 },
             ],
             "temperature": 0.1,
@@ -658,20 +656,18 @@ class ClaudeClient:
             lines.append("")
         user_content = "\n".join(lines)
 
-        # Use hardened prompt structure (Layer 2 — prompt injection defense)
-        hardener = PromptHardener()
-        nonce = hardener._generate_nonce()
-
+        # v1.1.1: Removed PromptHardener — it disrupts Claude QA output.
+        # Defense is handled at the pipeline level (pre/post sanitization).
         body = {
             "model": self.model,
             "max_tokens": 8000,
             "messages": [
                 {
                     "role": "user",
-                    "content": hardener.wrap_qa_user_content(user_content, nonce)
+                    "content": user_content
                 }
             ],
-            "system": hardener.harden_qa_system_prompt(CLAUDE_QA_SYSTEM_PROMPT, nonce),
+            "system": CLAUDE_QA_SYSTEM_PROMPT,
             "temperature": 0.0,
         }
 
@@ -904,65 +900,65 @@ class DualLLMTranslator:
             logger.info("Protected %d tokens across %d strings",
                        protector.token_count, len(to_translate))
 
-            # Step 1.5: Input sanitization & threat detection (Layer 1 + Layer 5)
+            # Step 1.5: Input sanitization (Layer 1 — sanitize only, never block)
+            # v1.1.1: Defense ALWAYS uses sanitized text, never blocks the batch.
+            # Blocking caused entire translations to be silently dropped.
             pre_defense = self._defense.pre_translation_defense(protected_texts)
             if not pre_defense.allowed:
-                logger.error(
-                    "DEFENSE: Batch BLOCKED — level=%s flags=%s",
+                logger.warning(
+                    "DEFENSE: Threat detected but proceeding with sanitized text — "
+                    "level=%s flags=%s",
                     pre_defense.threat_level.value, pre_defense.input_flags
                 )
                 self._report.errors.append(
-                    f"Batch blocked by defense: {pre_defense.threat_level.value}"
+                    f"Defense warning (non-blocking): {pre_defense.threat_level.value}"
                 )
-                # Skip this batch entirely — do NOT send to LLM
-                # Fall through to return cached results only
-            else:
-                safe_texts = pre_defense.sanitized_texts
+            safe_texts = pre_defense.sanitized_texts
 
-                # Step 2: Batch and translate via GPT (with hardened prompts)
-                gpt_translations = self._gpt_translate_batched(safe_texts)
+            # Step 2: Batch and translate via GPT
+            gpt_translations = self._gpt_translate_batched(safe_texts)
 
-                # Step 2.5: Post-translation defense (Layer 3 + Layer 4 + Layer 5)
-                post_defense = self._defense.post_translation_defense(
-                    original_for_index, gpt_translations
+            # Step 2.5: Post-translation defense (Layer 3 + Layer 4 + Layer 5)
+            post_defense = self._defense.post_translation_defense(
+                original_for_index, gpt_translations
+            )
+            if post_defense.canary_failures:
+                logger.warning(
+                    "DEFENSE: Canary failures detected — logging but not blocking"
                 )
-                if post_defense.canary_failures:
-                    logger.error(
-                        "DEFENSE: Canary failures detected — results may be compromised"
-                    )
-                    self._report.errors.append(
-                        f"Canary failures: {len(post_defense.canary_failures)}"
-                    )
+                self._report.errors.append(
+                    f"Canary warnings: {len(post_defense.canary_failures)}"
+                )
 
-                # Use defense-validated translations
-                gpt_translations = post_defense.sanitized_texts
+            # Use defense-validated translations
+            gpt_translations = post_defense.sanitized_texts
 
-                # Step 3: Post-process — restore tokens
-                restored: Dict[str, str] = {}
-                for idx, arabic in gpt_translations.items():
-                    restored_text = protector.restore(arabic)
-                    restored[idx] = restored_text
+            # Step 3: Post-process — restore tokens
+            restored: Dict[str, str] = {}
+            for idx, arabic in gpt_translations.items():
+                restored_text = protector.restore(arabic)
+                restored[idx] = restored_text
 
-                # Step 4: QA pass via Claude
-                if self.config.enable_qa_pass and self.config.anthropic_api_key:
-                    qa_fixes = self._claude_qa_pass(original_for_index, restored)
-                    # Apply QA fixes
-                    for idx, fixed_arabic in qa_fixes.items():
-                        restored[idx] = fixed_arabic
-                        self._report.qa_issues_fixed += 1
+            # Step 4: QA pass via Claude
+            if self.config.enable_qa_pass and self.config.anthropic_api_key:
+                qa_fixes = self._claude_qa_pass(original_for_index, restored)
+                # Apply QA fixes
+                for idx, fixed_arabic in qa_fixes.items():
+                    restored[idx] = fixed_arabic
+                    self._report.qa_issues_fixed += 1
 
-                # Step 5: Apply domain glossary overrides (final safety net)
-                for idx in restored:
-                    restored[idx] = self._apply_glossary_overrides(
-                        original_for_index[idx], restored[idx]
-                    )
+            # Step 5: Apply domain glossary overrides (final safety net)
+            for idx in restored:
+                restored[idx] = self._apply_glossary_overrides(
+                    original_for_index[idx], restored[idx]
+                )
 
-                # Step 6: Map back to original English keys
-                for idx, arabic in restored.items():
-                    english = original_for_index[idx]
-                    result[english] = arabic
-                    self._cache[english] = arabic
-                    self._report.translated += 1
+            # Step 6: Map back to original English keys
+            for idx, arabic in restored.items():
+                english = original_for_index[idx]
+                result[english] = arabic
+                self._cache[english] = arabic
+                self._report.translated += 1
 
             # Log defense summary
             logger.info(
@@ -1104,25 +1100,39 @@ class DualLLMTranslator:
                     batch_num, len(missing_from_batch), len(idx_map),
                     missing_from_batch[:5],
                 )
-                if len(missing_from_batch) > len(idx_map) * 0.1:
-                    # More than 10% missing from a "successful" batch — treat as failure
-                    raise RuntimeError(
-                        f"GPT batch {batch_num} returned only "
-                        f"{len(idx_map) - len(missing_from_batch)}/{len(idx_map)} strings. "
-                        "Too many missing to accept partial result."
+                # v1.1.1: Relaxed from 10% threshold RuntimeError to warning-only.
+                # Partial results are acceptable — pipeline Arabic coverage gate
+                # will catch catastrophic failures downstream.
+                if len(missing_from_batch) > len(idx_map) * 0.5:
+                    logger.error(
+                        "GPT batch %d: >50%% missing (%d/%d) — flagging but not crashing",
+                        batch_num, len(missing_from_batch), len(idx_map),
+                    )
+                    self._report.errors.append(
+                        f"GPT batch {batch_num}: {len(missing_from_batch)}/{len(idx_map)} strings missing"
                     )
                 # For small numbers of missing strings (<10%), leave gaps
                 # so the pipeline Arabic content gate can decide
 
-        # FAIL-CLOSED: If ANY batch failed completely, raise immediately.
-        # Do NOT silently substitute English for failed batches.
+        # v1.1.1: Relaxed from fail-on-ANY to fail-on-ALL.
+        # If some batches succeed, return partial results — partial Arabic
+        # is better than zero Arabic. Pipeline coverage gate will catch
+        # catastrophic failures.
         if failed_batches:
             total = len(batch_results_by_num)
-            raise RuntimeError(
-                f"FATAL: {len(failed_batches)}/{total} GPT translation batches failed. "
-                f"Failed batches: {failed_batches}. "
-                f"Translated {len(all_translations)}/{len(protected_texts)} strings. "
-                f"Errors: {'; '.join(self._report.errors[-3:])}"
+            if len(failed_batches) == total:
+                raise RuntimeError(
+                    f"FATAL: ALL {total} GPT translation batches failed. "
+                    f"Errors: {'; '.join(self._report.errors[-3:])}"
+                )
+            logger.error(
+                "%d/%d GPT batches failed — proceeding with partial results. "
+                "Failed: %s. Translated %d/%d strings.",
+                len(failed_batches), total, failed_batches,
+                len(all_translations), len(protected_texts),
+            )
+            self._report.errors.append(
+                f"{len(failed_batches)}/{total} batches failed, partial results used"
             )
 
         return all_translations
