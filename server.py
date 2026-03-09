@@ -63,6 +63,7 @@ PHASE_EXTRACTING = "extracting"
 PHASE_TRANSLATING = "translating"
 PHASE_RTL = "rtl_transforms"
 PHASE_QC = "quality_check"
+PHASE_PREVIEW = "generating_preview"
 PHASE_DONE = "done"
 
 
@@ -526,6 +527,7 @@ def _run_pipeline_worker(job_id: str) -> None:
             raise RuntimeError("Pipeline reported success but output file missing")
 
         # ── Preview from TRANSLATED Arabic output ─────────────────────
+        _set_job_state(job_id, current_phase=PHASE_PREVIEW, progress_pct=92)
         preview_dir = output_path.parent / "preview"
         # Clear any stale preview files from previous runs
         if preview_dir.exists():
@@ -550,6 +552,7 @@ def _run_pipeline_worker(job_id: str) -> None:
                 output_path.parent, job_id,
                 source_pptx=str(output_path), origin="output",
             )
+            _set_job_state(job_id, progress_pct=96)  # Signal: preview done, finalizing
             logger.info(
                 "Arabic preview generated for job %s (%d slides)",
                 job_id,
@@ -886,7 +889,7 @@ def apply_promo(payload: PromoCodeRequest):
 @app.get("/health")
 def health():
     try:
-        return {"status": "ok", "version": "1.1.1"}
+        return {"status": "ok", "version": "1.1.2"}
     except Exception as exc:
         logger.exception("/health failed: %s", exc)
         raise HTTPException(status_code=500, detail="Internal server error")
