@@ -1,0 +1,32 @@
+# Prevent build artifacts, metadata, and test files from being
+# copied into /app/slidearabi/ via "COPY . /app/slidearabi/"
+
+# Version control
+.git
+.github
+.gitignore
+
+# Python artifacts
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.egg-info
+dist/
+build/
+
+# Deployment config (already used at build time)
+Dockerfile
+.dockerignore
+railway.toml
+
+# Test files
+tests/
+test_harness.py
+
+# Documentation (not needed at runtime)
+*.md
+
+# Environment files
+.env
+.env.*

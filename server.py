@@ -1,3 +1,8 @@
+# === STARTUP DIAGNOSTIC — remove after Railway health check is resolved ===
+import sys as _sys, os as _os
+print(f"[BOOT] Python {_sys.version}, PID={_os.getpid()}, PORT={_os.environ.get('PORT', 'NOT SET')}", flush=True)
+# === END DIAGNOSTIC ===
+
 import base64
 import hashlib
 import json
@@ -103,7 +108,20 @@ VALID_PROMO_CODES: Dict[str, str] = {
 }
 
 
-app = FastAPI(title="SlideArabi API", version="1.0.0")
+app = FastAPI(title="SlideArabi API", version="1.1.0")
+
+
+# === STARTUP DIAGNOSTIC — remove after Railway deploy is stable ===
+@app.on_event("startup")
+async def _startup_diagnostic():
+    try:
+        import resource
+        peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        logger.info("[BOOT] FastAPI ready — peak RSS: %.0f MB, PORT=%s", peak_mb, os.environ.get("PORT", "NOT SET"))
+    except Exception:
+        logger.info("[BOOT] FastAPI ready")
+# === END DIAGNOSTIC ===
+
 
 app.add_middleware(
     CORSMiddleware,
