@@ -139,6 +139,7 @@ class SlideArabiPipeline:
             logger.info("Loading presentation...")
             try:
                 prs = Presentation(self.config.input_path)
+                self._prs = prs  # Store for supplementary text extraction
             except Exception as e:
                 raise ValueError(f"Failed to load presentation: {e}")
             
@@ -153,7 +154,19 @@ class SlideArabiPipeline:
             
             # Phase 3: Transform Slide Content
             p3_report = self._phase_3_transform_slides(prs, resolved_prs, translation_map)
-            
+
+            # ── PER-SLIDE COVERAGE CHECK (v1.1.3) ────────────────────────
+            if not self.config.skip_translation and translation_map:
+                untranslated = self._validate_slide_coverage(prs)
+                if untranslated:
+                    logger.error(
+                        "QUALITY ALERT: Slides %s appear untranslated after Phase 3",
+                        untranslated,
+                    )
+                    self._phase_reports['slide_coverage'] = {
+                        "untranslated_slides": untranslated,
+                    }
+
             # ── POST-TRANSFORM VERIFICATION ──────────────────────────────
             # Belt-and-suspenders: sample the in-memory prs for Arabic text
             # before saving. If translation_map had entries but no Arabic
@@ -501,14 +514,27 @@ class SlideArabiPipeline:
             
         return report
         
+    def _walk_all_shapes_pptx(self, shapes):
+        """Recursively yield all shapes including group children from a python-pptx shapes collection."""
+        for shape in shapes:
+            yield shape
+            if hasattr(shape, 'shapes'):  # GroupShape
+                yield from self._walk_all_shapes_pptx(shape.shapes)
+
     def _extract_texts(self, resolved: Any) -> List[str]:
-        """Extract all translatable text strings from the resolved presentation."""
+        """Extract all translatable text strings from the resolved presentation.
+
+        Uses two passes:
+        1. Walk the resolved model (shapes → paragraphs → runs)
+        2. Supplementary pass over raw python-pptx to capture table cell text
+           and group shape children that the resolved model may miss.
+        """
         texts = []
         if not resolved:
             return texts
-            
+
         try:
-            # Assuming resolved is a ResolvedPresentation with slides -> shapes -> paragraphs -> runs
+            # Pass 1: Resolved model walk
             for slide in resolved.slides:
                 for shape in slide.shapes:
                     for para in shape.paragraphs:
@@ -516,7 +542,7 @@ class SlideArabiPipeline:
                         para_text = "".join(run.text for run in para.runs if run.text).strip()
                         if para_text:
                             texts.append(para_text)
-                            
+
             # Deduplicate while preserving order
             seen = set()
             unique_texts = []
@@ -524,8 +550,44 @@ class SlideArabiPipeline:
                 if t not in seen:
                     seen.add(t)
                     unique_texts.append(t)
+
+            # Pass 2: Supplementary extraction from raw python-pptx
+            # Captures table cell text and group children missed by the resolver
+            prs = getattr(self, '_prs', None)
+            if prs is not None:
+                table_count = 0
+                group_count = 0
+                for slide in prs.slides:
+                    for shape in self._walk_all_shapes_pptx(slide.shapes):
+                        # Text frames (catches group children)
+                        if hasattr(shape, 'has_text_frame') and shape.has_text_frame:
+                            for para in shape.text_frame.paragraphs:
+                                text = para.text.strip()
+                                if text and text not in seen:
+                                    seen.add(text)
+                                    unique_texts.append(text)
+                                    group_count += 1
+                        # Table cells
+                        if hasattr(shape, 'has_table') and shape.has_table:
+                            for row in shape.table.rows:
+                                for cell in row.cells:
+                                    if cell.text_frame:
+                                        for para in cell.text_frame.paragraphs:
+                                            text = para.text.strip()
+                                            if text and text not in seen:
+                                                seen.add(text)
+                                                unique_texts.append(text)
+                                                table_count += 1
+                supplementary_total = table_count + group_count
+                if supplementary_total > 0:
+                    logger.info(
+                        "Supplementary extraction found %d additional strings "
+                        "(tables: %d, groups: %d)",
+                        supplementary_total, table_count, group_count,
+                    )
+
             return unique_texts
-            
+
         except AttributeError as e:
             # Log the actual error so the zero-tolerance gate's error is debuggable
             logger.error(
@@ -534,7 +596,44 @@ class SlideArabiPipeline:
                 exc_info=True,
             )
             return []
-        
+
+    def _validate_slide_coverage(self, prs) -> List[int]:
+        """Check each slide for Arabic content. Returns list of untranslated slide numbers."""
+        untranslated_slides = []
+        for i, slide in enumerate(prs.slides, start=1):
+            slide_text_count = 0
+            arabic_count = 0
+            for shape in slide.shapes:
+                if getattr(shape, 'has_text_frame', False) and shape.has_text_frame:
+                    for para in shape.text_frame.paragraphs:
+                        text = (para.text or '').strip()
+                        if text and len(text) > 3:  # Skip very short strings
+                            slide_text_count += 1
+                            if _ARABIC_RE.search(text):
+                                arabic_count += 1
+                # Also check table cells
+                if getattr(shape, 'has_table', False) and shape.has_table:
+                    for row in shape.table.rows:
+                        for cell in row.cells:
+                            if cell.text_frame:
+                                for para in cell.text_frame.paragraphs:
+                                    text = (para.text or '').strip()
+                                    if text and len(text) > 3:
+                                        slide_text_count += 1
+                                        if _ARABIC_RE.search(text):
+                                            arabic_count += 1
+
+            logger.info("Slide %d: %d/%d text elements contain Arabic", i, arabic_count, slide_text_count)
+
+            if slide_text_count >= 3 and arabic_count == 0:
+                logger.warning(
+                    "Slide %d: 0/%d text elements contain Arabic — likely untranslated",
+                    i, slide_text_count,
+                )
+                untranslated_slides.append(i)
+
+        return untranslated_slides
+
     def _phase_6_vqa(
         self,
     ) -> Any:

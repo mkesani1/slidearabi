@@ -856,7 +856,23 @@ class SlideContentTransformer:
                             changes += self._transform_table_rtl(child)
                         if getattr(child, 'has_chart', False) and child.has_chart:
                             changes += self._transform_chart_rtl(child)
+                    # Fix 4B: Directional reversal for group children (arrows, connectors)
+                    if hasattr(shape, 'shapes'):
+                        for child in shape.shapes:
+                            changes += self._reverse_directional_shape(child)
+                            changes += self._reverse_connector_direction(child)
+                            changes += self._reverse_line_arrowheads(child)
                     continue
+
+                # Fix 4A: Handle connector shapes (cxnSp)
+                sp_el = shape._element
+                if sp_el.tag.endswith('}cxnSp') or sp_el.tag == 'cxnSp':
+                    changes += self._reverse_connector_direction(shape)
+                    # Also mirror position
+                    if self._should_mirror_shape(shape, layout_type):
+                        if self._mirror_freeform_shape(shape, self._slide_width):
+                            changes += 1
+                    continue  # Connectors don't need text treatment
 
                 if getattr(shape, 'is_placeholder', False):
                     # Placeholder: remove local position override to inherit
@@ -932,6 +948,22 @@ class SlideContentTransformer:
 
         # Fix 9: Collision detection (log warnings for overlapping shapes)
         self._detect_collisions(all_shapes, slide_number)
+
+        # v1.1.3: Per-slide translation coverage telemetry
+        translated_shapes = 0
+        total_text_shapes = 0
+        for s in all_shapes:
+            if getattr(s, 'has_text_frame', False) and any(
+                p.text.strip() for p in s.text_frame.paragraphs if p.text
+            ):
+                total_text_shapes += 1
+                if any(has_arabic(p.text) for p in s.text_frame.paragraphs if p.text):
+                    translated_shapes += 1
+        if total_text_shapes > 0 and translated_shapes == 0:
+            logger.error(
+                'Slide %d: 0/%d text shapes translated — possible extraction miss',
+                slide_number, total_text_shapes,
+            )
 
         return changes
 
@@ -1831,6 +1863,17 @@ class SlideContentTransformer:
         except Exception as exc:
             logger.warning('_transform_table_rtl on "%s": %s',
                            getattr(shape, 'name', '?'), exc)
+
+        # v1.1.3: Table transform telemetry
+        try:
+            logger.info(
+                'Table RTL on "%s": %d cols, %d rows, tblPr.rtl=%s, changes=%d',
+                getattr(shape, 'name', '?'), num_cols, len(table.rows),
+                tbl_pr.get('rtl', 'not set') if tbl_pr is not None else 'no tblPr',
+                changes,
+            )
+        except Exception:
+            pass
 
         return changes
 
@@ -3704,4 +3747,80 @@ class SlideContentTransformer:
         except Exception as exc:
             logger.debug('_reverse_directional_shape: %s', exc)
         return 0
+
+    def _reverse_connector_direction(self, shape) -> int:
+        """Reverse connector arrow direction for RTL by swapping headEnd/tailEnd markers."""
+        try:
+            sp_el = shape._element
+            if not (sp_el.tag.endswith('}cxnSp') or sp_el.tag == 'cxnSp'):
+                return 0
+
+            a_ns = A_NS
+            ln = sp_el.find(f'.//{{{a_ns}}}ln')
+            if ln is None:
+                return 0
+
+            head = ln.find(f'{{{a_ns}}}headEnd')
+            tail = ln.find(f'{{{a_ns}}}tailEnd')
+
+            if head is None and tail is None:
+                return 0
+
+            head_copy = deepcopy(head) if head is not None else None
+            tail_copy = deepcopy(tail) if tail is not None else None
+
+            if head is not None:
+                ln.remove(head)
+            if tail is not None:
+                ln.remove(tail)
+
+            # Swap: old tail becomes new head, old head becomes new tail
+            if tail_copy is not None:
+                tail_copy.tag = f'{{{a_ns}}}headEnd'
+                ln.append(tail_copy)
+            if head_copy is not None:
+                head_copy.tag = f'{{{a_ns}}}tailEnd'
+                ln.append(head_copy)
+
+            logger.debug("Reversed connector arrowheads on %s", getattr(shape, 'name', '?'))
+            return 1
+        except Exception as exc:
+            logger.debug('_reverse_connector_direction: %s', exc)
+            return 0
+
+    def _reverse_line_arrowheads(self, shape) -> int:
+        """Swap head/tail arrowhead markers on line shapes for RTL flow."""
+        try:
+            sp_el = shape._element
+            a_ns = A_NS
+            ln = sp_el.find(f'.//{{{a_ns}}}ln')
+            if ln is None:
+                return 0
+
+            head_end = ln.find(f'{{{a_ns}}}headEnd')
+            tail_end = ln.find(f'{{{a_ns}}}tailEnd')
+
+            if head_end is None and tail_end is None:
+                return 0
+
+            head_attribs = dict(head_end.attrib) if head_end is not None else None
+            tail_attribs = dict(tail_end.attrib) if tail_end is not None else None
+
+            if head_end is not None:
+                ln.remove(head_end)
+            if tail_end is not None:
+                ln.remove(tail_end)
+
+            if tail_attribs:
+                new_head = etree.SubElement(ln, f'{{{a_ns}}}headEnd')
+                for k, v in tail_attribs.items():
+                    new_head.set(k, v)
+            if head_attribs:
+                new_tail = etree.SubElement(ln, f'{{{a_ns}}}tailEnd')
+                for k, v in head_attribs.items():
+                    new_tail.set(k, v)
+
+            return 1
+        except Exception:
+            return 0
 

@@ -1744,15 +1744,18 @@ class PropertyResolver:
         return False
 
     def _collect_all_shapes(self, shapes_collection) -> List[Any]:
-        """Collect all shapes including group children (flattened).
+        """Collect all shapes including group children (flattened one level).
 
-        Does not recurse into nested groups beyond one level to avoid
-        double-counting in the coordinate space.
+        Recurses one level into group shapes so that text inside groups
+        (e.g. grouped text boxes, table cells) is captured by the resolver.
         """
         result = []
         try:
             for shape in shapes_collection:
                 result.append(shape)
+                if hasattr(shape, 'shapes'):  # GroupShape — recurse one level
+                    for child in shape.shapes:
+                        result.append(child)
         except Exception:
             pass
         return result

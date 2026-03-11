@@ -109,7 +109,7 @@ VALID_PROMO_CODES: Dict[str, str] = {
 }
 
 
-app = FastAPI(title="SlideArabi API", version="1.1.1")
+app = FastAPI(title="SlideArabi API", version="1.1.3")
 
 
 # === STARTUP DIAGNOSTIC — remove after Railway deploy is stable ===
@@ -211,7 +211,12 @@ def _apply_watermark(
 
     Uses Pillow to draw repeated diagonal text so the watermark is visible
     regardless of slide content. Overwrites the original file in-place.
+
+    Watermark density reduced in v1.1.3 — sparse enough for quality evaluation,
+    visible enough for IP protection.
     """
+    watermark_mode = os.getenv("WATERMARK_MODE", "light")
+
     with Image.open(image_path) as base:
         base = base.convert("RGBA")
         width, height = base.size
@@ -219,8 +224,8 @@ def _apply_watermark(
         txt_layer = Image.new("RGBA", base.size, (255, 255, 255, 0))
         draw = ImageDraw.Draw(txt_layer)
 
-        # Dynamic font size: ~8% of image width
-        font_size = max(28, int(width * 0.08))
+        # Dynamic font size: ~5% of image width (was 8%)
+        font_size = max(20, int(width * 0.05))
 
         # Try several font paths (Docker / macOS / Linux fallbacks)
         font = None
@@ -242,21 +247,32 @@ def _apply_watermark(
         text_w = bbox[2] - bbox[0]
         text_h = bbox[3] - bbox[1]
 
-        shadow_color = (0, 0, 0, 60)
-        text_color = (255, 255, 255, 100)
+        shadow_color = (0, 0, 0, 28)    # Was 60
+        text_color = (255, 255, 255, 55) # Was 100
 
-        # Tile watermark text across the image in a grid pattern
-        spacing_x = text_w + int(width * 0.15)
-        spacing_y = text_h + int(height * 0.25)
-
-        for y in range(-height, height * 2, spacing_y):
-            for x in range(-width, width * 2, spacing_x):
-                draw.text((x + 2, y + 2), watermark_text, font=font, fill=shadow_color)
+        if watermark_mode == "light":
+            # Light mode: 3 fixed diagonal positions instead of dense tiling
+            positions = [
+                (int(width * 0.10), int(height * 0.20)),
+                (int(width * 0.38), int(height * 0.48)),
+                (int(width * 0.66), int(height * 0.76)),
+            ]
+            for x, y in positions:
+                draw.text((x + 1, y + 1), watermark_text, font=font, fill=shadow_color)
                 draw.text((x, y), watermark_text, font=font, fill=text_color)
+        else:
+            # Heavy mode — tiling with improved spacing
+            spacing_x = int(text_w * 1.8)
+            spacing_y = int(height * 0.45)
+
+            for y in range(0, height * 2, spacing_y):
+                for x in range(0, width * 2, spacing_x):
+                    draw.text((x + 1, y + 1), watermark_text, font=font, fill=shadow_color)
+                    draw.text((x, y), watermark_text, font=font, fill=text_color)
 
         # Rotate the text layer for diagonal effect
         watermark_layer = txt_layer.rotate(
-            30, resample=Image.BICUBIC, expand=False,
+            28, resample=Image.BICUBIC, expand=False,  # Was 30
             center=(width // 2, height // 2),
         )
 
@@ -889,7 +905,7 @@ def apply_promo(payload: PromoCodeRequest):
 @app.get("/health")
 def health():
     try:
-        return {"status": "ok", "version": "1.1.2"}
+        return {"status": "ok", "version": "1.1.3"}
     except Exception as exc:
         logger.exception("/health failed: %s", exc)
         raise HTTPException(status_code=500, detail="Internal server error")
