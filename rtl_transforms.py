@@ -215,20 +215,14 @@ class MasterLayoutTransformer:
 
     def _apply_rtl_direction_defaults(self, xml_element) -> int:
         """
-        Set direction defaults on master/layout elements.
+        Set default RTL direction on master/layout elements.
 
-        Round 2 fix: Do NOT set rtl='1' at master/layout level.
-        Setting rtl='1' in inherited paragraph properties causes ALL text
-        (including English) to be treated as bidi RTL, which corrupts
-        period placement and word order in English text.
+        - bodyPr → rtlCol="1" (column order)
+        - defPPr → rtl="1" (default paragraph direction)
+        - lstStyle/lvlNpPr → rtl="1" (list level paragraph direction)
 
-        Instead:
-        - rtlCol='1' on bodyPr is safe (controls column direction, not text)
-        - rtl on lstStyle/defPPr is NOT set (slide-level _set_rtl_alignment_unconditional
-          handles this per-paragraph based on actual script detection)
-
-        Critical: NO algn writes here — alignment is context-sensitive and
-        must be set at the slide paragraph level only.
+        CRITICAL: Do NOT set algn here — alignment is context-sensitive
+        and must be set per-paragraph at slide level.
         """
         changes = 0
 
@@ -237,9 +231,17 @@ class MasterLayoutTransformer:
             body_pr.set('rtlCol', '1')
             changes += 1
 
-        # DO NOT set rtl='1' on lstStyle or defPPr — this is handled
-        # per-paragraph at slide level based on actual script content.
-        # The old code set rtl='1' here which caused English text corruption.
+        # defPPr → rtl="1" (default paragraph direction, but NOT algn)
+        for def_ppr in xml_element.iter(f'{{{A_NS}}}defPPr'):
+            def_ppr.set('rtl', '1')
+            changes += 1
+
+        # lstStyle/lvlNpPr → rtl="1" (list level direction, but NOT algn)
+        for lst_style in xml_element.iter(f'{{{A_NS}}}lstStyle'):
+            for child in lst_style:
+                if child.tag.startswith(f'{{{A_NS}}}lvl') and child.tag.endswith('pPr'):
+                    child.set('rtl', '1')
+                    changes += 1
 
         return changes
 
@@ -255,11 +257,9 @@ class MasterLayoutTransformer:
         """
         Set RTL-related defaults in the master's txStyles element.
 
-        Round 2 fix: Do NOT set rtl='1' on txStyles paragraph properties.
-        This caused English text corruption (period displacement, word reordering).
-
-        Only set language defaults on defRPr for Arabic font selection.
-        RTL direction is handled per-paragraph at slide level.
+        Sets rtl='1' on txStyles lvlNpPr for default RTL direction,
+        and lang='ar-SA' on defRPr for Arabic font selection.
+        Does NOT set algn — alignment is per-paragraph at slide level.
         """
         changes = 0
         try:
@@ -274,8 +274,10 @@ class MasterLayoutTransformer:
                     continue
                 for level in range(1, 10):
                     for lvl_pPr in style_elem.findall(f'{{{A_NS}}}lvl{level}pPr'):
-                        # DO NOT set rtl='1' here — causes English text corruption.
-                        # Only set language for Arabic font selection
+                        # Set rtl='1' for default paragraph direction (not algn)
+                        lvl_pPr.set('rtl', '1')
+                        changes += 1
+                        # Set language for Arabic font selection
                         defRPr = lvl_pPr.find(f'{{{A_NS}}}defRPr')
                         if defRPr is not None:
                             defRPr.set('lang', 'ar-SA')
@@ -1468,12 +1470,18 @@ class SlideContentTransformer:
         try:
             slide_width = self._slide_width
 
+            # Layout-specific rules (checked first — before positional checks)
+            # secHead/title layouts are typically centered/symmetrical by design;
+            # never mirror their shapes.
+            if layout_type in ('secHead', 'title'):
+                return False
+
             # Full-width background shapes: never mirror
             width = getattr(shape, 'width', None)
             if width is not None and width > slide_width * 0.90:
                 return False
 
-            # Fix 3: Footer-zone shapes — ALWAYS mirror regardless of layout
+            # Footer-zone shapes — ALWAYS mirror regardless of layout
             top = getattr(shape, 'top', None)
             height = getattr(shape, 'height', None)
             if top is not None and height is not None:
@@ -1481,18 +1489,6 @@ class SlideContentTransformer:
                 slide_height = self._slide_height
                 if bottom > slide_height * 0.88:
                     return True  # Footer zone — always mirror
-
-            # Layout-specific rules
-            # Fix 2: secHead/title layouts — only skip large decorative backgrounds,
-            # still mirror text boxes and content shapes
-            if layout_type in ('secHead', 'title'):
-                # Only skip large background decorative shapes (>50% of slide width)
-                width = getattr(shape, 'width', None)
-                if width is not None and width > slide_width * 0.50:
-                    # Large shape — likely decorative background, skip
-                    return False
-                # Smaller shapes on secHead/title — mirror them
-                return True
 
             # By default, mirror content-sized shapes
             return True
@@ -1697,9 +1693,9 @@ class SlideContentTransformer:
             return 'l'
 
         # Title placeholders: center-align (preserve original design intent)
-        # Match 'title (1)', 'center_title (3)', 'vertical_title (5)'
+        # Match 'title (1)', 'center_title (3)', 'vertical_title (5)', 'ctrTitle'
         # but NOT 'subtitle (4)' — subtitles are body-like
-        if ph_type and ('subtitle' not in ph_type) and any(t in ph_type for t in ('title',)):
+        if ph_type and ('subtitle' not in ph_type.lower()) and ('title' in ph_type.lower()):
             return 'ctr'
 
         ratios = compute_script_ratio(text)
@@ -1709,8 +1705,8 @@ class SlideContentTransformer:
         if arabic_ratio > 0.70:
             return 'r'
         elif latin_ratio > 0.70 and not has_arabic(text):
-            # Fix 1: Pure Latin text — still right-align in RTL context
-            return 'r'
+            # Pure Latin text should remain left-aligned
+            return 'l'
         else:
             # Mixed content or ambiguous — default to right in Arabic context
             return 'r'
