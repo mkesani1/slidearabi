@@ -89,6 +89,10 @@ class TranslatorConfig:
     max_retries: int = 2                 # Retries per API call on failure
     retry_delay: float = 2.0            # Seconds between retries
 
+    # Coverage thresholds (v1.1.3)
+    min_translation_coverage: float = float(os.getenv("SLIDEARABI_MIN_COVERAGE", "0.90"))
+    max_sanitizer_drop_pct: float = float(os.getenv("SLIDEARABI_MAX_SANITIZER_DROP", "0.20"))
+
     # Parallelism
     max_translation_workers: int = 3
     max_qa_workers: int = 2
@@ -919,11 +923,14 @@ class DualLLMTranslator:
             # Brand names (TransferWise, Xoom, etc.) should not be silently dropped
             if protected_texts:
                 dropped_pct = 1.0 - (len(safe_texts) / max(len(protected_texts), 1))
-                if dropped_pct > 0.20:
+                max_drop = self.config.max_sanitizer_drop_pct
+                if dropped_pct > max_drop:
                     logger.warning(
-                        "DEFENSE: sanitizer dropped %.0f%% of strings (%d -> %d) — "
-                        "reverting to protected_texts to avoid silent translation loss",
+                        "SECURITY: defense sanitizer dropped %.0f%% of strings (%d -> %d), "
+                        "exceeding %.0f%% threshold — reverting to protected_texts. "
+                        "Audit recommended to verify no malicious content bypassed.",
                         dropped_pct * 100, len(protected_texts), len(safe_texts),
+                        max_drop * 100,
                     )
                     safe_texts = protected_texts
 
@@ -1137,22 +1144,25 @@ class DualLLMTranslator:
                 else:
                     logger.error("Batch %d failed even after sub-batch retry: %s", batch_num, error_msg)
 
-        # v1.1.3: Check coverage after retries — fail if < 95%
+        # v1.1.3: Check coverage after retries — fail if below configured threshold
         if protected_texts:
             translated_ratio = len(all_translations) / max(1, len(protected_texts))
+            min_coverage = self.config.min_translation_coverage
             logger.info(
                 "Translation batches: %d total, %d succeeded, %d failed, "
-                "%d strings translated out of %d (%.1f%%)",
+                "%d strings translated out of %d (%.1f%%), threshold=%.0f%%",
                 total_batches,
                 total_batches - len(failed_batches),
                 len(failed_batches),
                 len(all_translations),
                 len(protected_texts),
                 translated_ratio * 100,
+                min_coverage * 100,
             )
-            if translated_ratio < 0.95 and failed_batches:
+            if translated_ratio < min_coverage and failed_batches:
                 raise RuntimeError(
-                    f"Translation incomplete: only {translated_ratio:.1%} of strings translated. "
+                    f"Translation incomplete: only {translated_ratio:.1%} of strings translated "
+                    f"(threshold: {min_coverage:.0%}). "
                     f"Failed batches: {[b[0] for b in failed_batches]}"
                 )
 
@@ -1164,9 +1174,14 @@ class DualLLMTranslator:
         idx_map: Dict[str, str],
         batch_num: int,
     ) -> Dict[str, str]:
-        """Retry a failed batch by splitting into smaller sub-batches."""
+        """Retry a failed batch by splitting into smaller sub-batches.
+
+        Splits the failed batch into progressively smaller chunks (20 → 10 → 5 → 1)
+        and re-sends each to GPT. Index mapping is hardened with bounds checking
+        and type validation to handle malformed LLM responses.
+        """
         items = list(renumbered.items())
-        for sub_size in [20, 10, 5]:
+        for sub_size in [20, 10, 5, 1]:
             merged: Dict[str, str] = {}
             all_ok = True
             for start in range(0, len(items), sub_size):
@@ -1176,10 +1191,33 @@ class DualLLMTranslator:
                 sub_keys = list(sub.keys())
                 try:
                     sub_result = self.gpt.translate_batch(sub_renumbered)
-                    # Map back to original indices
+                    if not isinstance(sub_result, dict):
+                        logger.warning(
+                            "Sub-batch returned non-dict: %s", type(sub_result).__name__
+                        )
+                        all_ok = False
+                        break
+                    # Map back to original indices with hardened bounds checking
                     for sub_idx, arabic in sub_result.items():
-                        original_batch_idx = sub_keys[int(sub_idx) - 1] if int(sub_idx) <= len(sub_keys) else sub_idx
-                        orig_idx = idx_map.get(str(original_batch_idx), str(original_batch_idx))
+                        try:
+                            idx_int = int(sub_idx)
+                        except (ValueError, TypeError):
+                            logger.warning(
+                                "Sub-batch returned non-numeric key '%s' — skipping",
+                                sub_idx,
+                            )
+                            continue
+                        if 1 <= idx_int <= len(sub_keys):
+                            original_batch_idx = sub_keys[idx_int - 1]
+                        else:
+                            logger.warning(
+                                "Sub-batch index %d out of range [1..%d] — skipping",
+                                idx_int, len(sub_keys),
+                            )
+                            continue
+                        orig_idx = idx_map.get(
+                            str(original_batch_idx), str(original_batch_idx)
+                        )
                         merged[orig_idx] = arabic
                 except Exception as e:
                     logger.warning("Sub-batch (size=%d) failed: %s", sub_size, e)

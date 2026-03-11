@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -625,7 +626,8 @@ class SlideArabiPipeline:
 
             logger.info("Slide %d: %d/%d text elements contain Arabic", i, arabic_count, slide_text_count)
 
-            if slide_text_count >= 3 and arabic_count == 0:
+            min_text_for_check = int(os.getenv("SLIDEARABI_MIN_TEXT_ELEMENTS", "3"))
+            if slide_text_count >= min_text_for_check and arabic_count == 0:
                 logger.warning(
                     "Slide %d: 0/%d text elements contain Arabic — likely untranslated",
                     i, slide_text_count,

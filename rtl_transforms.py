@@ -3784,8 +3784,8 @@ class SlideContentTransformer:
 
             logger.debug("Reversed connector arrowheads on %s", getattr(shape, 'name', '?'))
             return 1
-        except Exception as exc:
-            logger.debug('_reverse_connector_direction: %s', exc)
+        except (AttributeError, KeyError, ValueError, TypeError) as exc:
+            logger.debug('_reverse_connector_direction: %s on %s', exc, getattr(shape, 'name', '?'))
             return 0
 
     def _reverse_line_arrowheads(self, shape) -> int:
@@ -3821,6 +3821,7 @@ class SlideContentTransformer:
                     new_tail.set(k, v)
 
             return 1
-        except Exception:
+        except (AttributeError, KeyError, ValueError, TypeError) as exc:
+            logger.debug('_reverse_line_arrowheads: %s on %s', exc, getattr(shape, 'name', '?'))
             return 0
 
