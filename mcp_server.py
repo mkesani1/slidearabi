@@ -41,7 +41,14 @@ from typing import Any, Optional
 import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
-from fastmcp.server.dependencies import CurrentHeaders
+try:
+    from fastmcp.server.dependencies import CurrentHeaders
+except ImportError:
+    # Fallback for older fastmcp versions
+    from fastmcp.server.dependencies import get_http_headers
+    def CurrentHeaders():
+        """Compatibility shim — returns HTTP headers dict."""
+        return get_http_headers()
 from supabase import Client as SupabaseClient, create_client
 
 logger = logging.getLogger("slidearabi.mcp_server")
