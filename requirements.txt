@@ -3,7 +3,7 @@
 
 # Web server
 fastapi==0.115.6
-uvicorn[standard]==0.34.0
+uvicorn[standard]>=0.35.0
 
 # PowerPoint processing
 python-pptx==1.0.2
