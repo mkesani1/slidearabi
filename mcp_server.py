@@ -839,4 +839,4 @@ def create_mcp_app():
         from slidearabi.mcp_server import create_mcp_app
         app.mount("/mcp", create_mcp_app())
     """
-    return mcp.http_app(path="/mcp", transport="streamable-http")
+    return mcp.http_app(path="/", transport="streamable-http")

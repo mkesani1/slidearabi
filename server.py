@@ -928,10 +928,13 @@ def apply_promo(payload: PromoCodeRequest):
 @app.get("/health")
 def health():
     try:
+        # Detect mounted agent stack components
+        route_paths = [getattr(r, 'path', '') for r in app.routes]
+        mount_paths = [getattr(r, 'path', '') for r in app.routes if hasattr(r, 'app')]
         agent_stack = {
-            "rest_api": "/v1" in [r.path for r in app.routes] or any("/v1" in str(getattr(r, 'prefix', '')) for r in app.router.routes),
-            "mcp": any("/mcp" in str(getattr(r, 'path', '')) for r in app.routes),
-            "stripe_webhooks": any("stripe" in str(getattr(r, 'path', '')) for r in app.routes),
+            "rest_api": any(p.startswith('/v1') for p in route_paths),
+            "mcp": '/mcp' in mount_paths,
+            "stripe_webhooks": any('stripe' in p.lower() or 'webhook' in p.lower() for p in route_paths),
         }
         return {"status": "ok", "version": "1.1.3", "agent_stack": agent_stack}
     except Exception as exc:
