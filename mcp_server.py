@@ -41,14 +41,7 @@ from typing import Any, Optional
 import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
-try:
-    from fastmcp.server.dependencies import CurrentHeaders
-except ImportError:
-    # Fallback for older fastmcp versions
-    from fastmcp.server.dependencies import get_http_headers
-    def CurrentHeaders():
-        """Compatibility shim — returns HTTP headers dict."""
-        return get_http_headers()
+from fastmcp.server.dependencies import get_http_headers
 from supabase import Client as SupabaseClient, create_client
 
 logger = logging.getLogger("slidearabi.mcp_server")
@@ -107,7 +100,7 @@ async def _get_auth_context(headers: dict[str, str]) -> dict[str, Any]:
     table and resolves the associated account.
 
     Args:
-        headers: HTTP headers dict injected via ``CurrentHeaders()``.
+        headers: HTTP headers dict injected via ``get_http_headers()``.
 
     Returns:
         ``{"account_id": str, "api_key_id": str, "plan_tier": str, "is_test": bool}``
@@ -222,8 +215,7 @@ async def upload_presentation(
     filename: str,
     file_base64: Optional[str] = None,
     file_url: Optional[str] = None,
-    headers: dict[str, str] = CurrentHeaders(),
-) -> dict[str, Any]:
+    ) -> dict[str, Any]:
     """Upload a PowerPoint (.pptx) file for English-to-Arabic RTL conversion.
 
     Provide the file as either base64-encoded content OR a publicly accessible
@@ -240,6 +232,7 @@ async def upload_presentation(
         credits_available, expires_at. If credits are insufficient, includes
         a warning and top_up_url.
     """
+    headers = get_http_headers()
     auth = await _get_auth_context(headers)
 
     if not filename.lower().endswith(".pptx"):
@@ -343,8 +336,7 @@ async def upload_presentation(
 async def convert_presentation(
     upload_id: str,
     options: Optional[dict[str, Any]] = None,
-    headers: dict[str, str] = CurrentHeaders(),
-) -> dict[str, Any]:
+    ) -> dict[str, Any]:
     """Start English-to-Arabic RTL conversion of a previously uploaded PowerPoint file.
 
     Conversion takes 2-8 minutes depending on slide count. After calling this,
@@ -361,6 +353,7 @@ async def convert_presentation(
         job_id, status ("queued"), slide_count, credits_reserved,
         estimated_minutes, poll_interval_seconds.
     """
+    headers = get_http_headers()
     auth = await _get_auth_context(headers)
     sb = _get_supabase()
 
@@ -485,8 +478,7 @@ async def convert_presentation(
 @mcp.tool()
 async def get_conversion_status(
     job_id: str,
-    headers: dict[str, str] = CurrentHeaders(),
-) -> dict[str, Any]:
+    ) -> dict[str, Any]:
     """Check the status and progress of a conversion job.
 
     Poll this every 20-30 seconds after calling convert_presentation.
@@ -502,6 +494,7 @@ async def get_conversion_status(
         When status is 'failed': includes error_code, error_message,
         credits_refunded.
     """
+    headers = get_http_headers()
     auth = await _get_auth_context(headers)
     sb = _get_supabase()
 
@@ -639,8 +632,7 @@ async def get_conversion_status(
 async def download_result(
     job_id: str,
     format: str = "url",
-    headers: dict[str, str] = CurrentHeaders(),
-) -> dict[str, Any]:
+    ) -> dict[str, Any]:
     """Download the completed Arabic RTL PowerPoint file.
 
     Only available after get_conversion_status returns status 'done'.
@@ -659,6 +651,7 @@ async def download_result(
     if format not in ("url", "base64"):
         raise ToolError("format must be 'url' or 'base64'.")
 
+    headers = get_http_headers()
     auth = await _get_auth_context(headers)
     sb = _get_supabase()
 
@@ -767,8 +760,7 @@ async def download_result(
 
 @mcp.tool()
 async def get_account_info(
-    headers: dict[str, str] = CurrentHeaders(),
-) -> dict[str, Any]:
+    ) -> dict[str, Any]:
     """Check your credit balance, usage statistics, and account limits.
 
     No inputs required — uses your API key for authentication.
@@ -778,6 +770,7 @@ async def get_account_info(
         credits_available, credits_reserved, credits_used_this_month,
         plan, rate_limits, top_up_url.
     """
+    headers = get_http_headers()
     auth = await _get_auth_context(headers)
     sb = _get_supabase()
 
