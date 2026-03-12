@@ -138,6 +138,29 @@ app.add_middleware(
     max_age=3600,
 )
 
+# ─── Agent Stack: REST API v1 + MCP + Stripe Credits ────────────────────────
+try:
+    from slidearabi.api_gateway import api_router
+    app.include_router(api_router, prefix="/v1")
+    logger.info("[AGENT] REST API gateway mounted at /v1")
+except Exception as exc:
+    logger.warning("[AGENT] REST API gateway not mounted: %s", exc)
+
+try:
+    from slidearabi.stripe_credits import stripe_router
+    app.include_router(stripe_router)
+    logger.info("[AGENT] Stripe credits webhook mounted")
+except Exception as exc:
+    logger.warning("[AGENT] Stripe credits not mounted: %s", exc)
+
+try:
+    from slidearabi.mcp_server import create_mcp_app
+    app.mount("/mcp", create_mcp_app())
+    logger.info("[AGENT] MCP server mounted at /mcp")
+except Exception as exc:
+    logger.warning("[AGENT] MCP server not mounted: %s", exc)
+# ─── End Agent Stack ────────────────────────────────────────────────────────
+
 
 def _cleanup_expired_jobs() -> None:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=JOB_TTL_HOURS)
@@ -905,7 +928,12 @@ def apply_promo(payload: PromoCodeRequest):
 @app.get("/health")
 def health():
     try:
-        return {"status": "ok", "version": "1.1.3"}
+        agent_stack = {
+            "rest_api": "/v1" in [r.path for r in app.routes] or any("/v1" in str(getattr(r, 'prefix', '')) for r in app.router.routes),
+            "mcp": any("/mcp" in str(getattr(r, 'path', '')) for r in app.routes),
+            "stripe_webhooks": any("stripe" in str(getattr(r, 'path', '')) for r in app.routes),
+        }
+        return {"status": "ok", "version": "1.1.3", "agent_stack": agent_stack}
     except Exception as exc:
         logger.exception("/health failed: %s", exc)
         raise HTTPException(status_code=500, detail="Internal server error")
