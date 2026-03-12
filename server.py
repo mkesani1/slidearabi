@@ -153,11 +153,13 @@ try:
 except Exception as exc:
     logger.warning("[AGENT] Stripe credits not mounted: %s", exc)
 
+_mcp_error = None
 try:
     from slidearabi.mcp_server import create_mcp_app
     app.mount("/mcp", create_mcp_app())
     logger.info("[AGENT] MCP server mounted at /mcp")
 except Exception as exc:
+    _mcp_error = str(exc)
     logger.warning("[AGENT] MCP server not mounted: %s", exc)
 # ─── End Agent Stack ────────────────────────────────────────────────────────
 
@@ -936,6 +938,8 @@ def health():
             "mcp": '/mcp' in mount_paths,
             "stripe_webhooks": any('stripe' in p.lower() or 'webhook' in p.lower() for p in route_paths),
         }
+        if _mcp_error:
+            agent_stack["mcp_error"] = _mcp_error
         return {"status": "ok", "version": "1.1.3", "agent_stack": agent_stack}
     except Exception as exc:
         logger.exception("/health failed: %s", exc)
