@@ -85,9 +85,13 @@ class TranslatorConfig:
     claude_model: str = "claude-sonnet-4-6"  # Claude Sonnet 4.6 (QA reviewer)
 
     # Batching
-    batch_size: int = 40                 # Strings per API call
+    batch_size: int = 25                 # Was 40 — reduced for reliability with Arabic expansion
     max_retries: int = 2                 # Retries per API call on failure
     retry_delay: float = 2.0            # Seconds between retries
+
+    # Coverage thresholds (v1.1.3)
+    min_translation_coverage: float = float(os.getenv("SLIDEARABI_MIN_COVERAGE", "0.90"))
+    max_sanitizer_drop_pct: float = float(os.getenv("SLIDEARABI_MAX_SANITIZER_DROP", "0.20"))
 
     # Parallelism
     max_translation_workers: int = 3
@@ -530,7 +534,7 @@ class GPTClient:
             ],
             "temperature": 0.1,
             "response_format": {"type": "json_object"},
-            "max_completion_tokens": 16000,
+            "max_completion_tokens": 32000,  # Was 16000 — Arabic text expansion needs headroom
         }
 
         headers = {
@@ -915,6 +919,21 @@ class DualLLMTranslator:
                 )
             safe_texts = pre_defense.sanitized_texts
 
+            # v1.1.3: Guard against defense sanitizer silently dropping strings
+            # Brand names (TransferWise, Xoom, etc.) should not be silently dropped
+            if protected_texts:
+                dropped_pct = 1.0 - (len(safe_texts) / max(len(protected_texts), 1))
+                max_drop = self.config.max_sanitizer_drop_pct
+                if dropped_pct > max_drop:
+                    logger.warning(
+                        "SECURITY: defense sanitizer dropped %.0f%% of strings (%d -> %d), "
+                        "exceeding %.0f%% threshold — reverting to protected_texts. "
+                        "Audit recommended to verify no malicious content bypassed.",
+                        dropped_pct * 100, len(protected_texts), len(safe_texts),
+                        max_drop * 100,
+                    )
+                    safe_texts = protected_texts
+
             # Step 2: Batch and translate via GPT
             gpt_translations = self._gpt_translate_batched(safe_texts)
 
@@ -1083,7 +1102,7 @@ class DualLLMTranslator:
             if error_msg:
                 self._report.errors.append(error_msg)
                 logger.error(error_msg)
-                failed_batches.append(batch_num)
+                failed_batches.append((batch_num, error_msg))
                 continue
 
             self._report.gpt_batches += 1
@@ -1100,9 +1119,6 @@ class DualLLMTranslator:
                     batch_num, len(missing_from_batch), len(idx_map),
                     missing_from_batch[:5],
                 )
-                # v1.1.1: Relaxed from 10% threshold RuntimeError to warning-only.
-                # Partial results are acceptable — pipeline Arabic coverage gate
-                # will catch catastrophic failures downstream.
                 if len(missing_from_batch) > len(idx_map) * 0.5:
                     logger.error(
                         "GPT batch %d: >50%% missing (%d/%d) — flagging but not crashing",
@@ -1111,31 +1127,109 @@ class DualLLMTranslator:
                     self._report.errors.append(
                         f"GPT batch {batch_num}: {len(missing_from_batch)}/{len(idx_map)} strings missing"
                     )
-                # For small numbers of missing strings (<10%), leave gaps
-                # so the pipeline Arabic content gate can decide
 
-        # v1.1.1: Relaxed from fail-on-ANY to fail-on-ALL.
-        # If some batches succeed, return partial results — partial Arabic
-        # is better than zero Arabic. Pipeline coverage gate will catch
-        # catastrophic failures.
+        # v1.1.3: Retry failed batches with smaller sub-batches before giving up
         if failed_batches:
-            total = len(batch_results_by_num)
-            if len(failed_batches) == total:
+            logger.warning("Retrying %d failed batches with smaller sub-batches", len(failed_batches))
+            # Reconstruct batch payloads for failed batches
+            batch_payload_map = {bp[0]: bp for bp in batch_payloads}
+            for batch_num, error_msg in failed_batches:
+                payload = batch_payload_map.get(batch_num)
+                if not payload:
+                    continue
+                _, renumbered, idx_map, _ = payload
+                retried = self._retry_with_smaller_chunks(renumbered, idx_map, batch_num)
+                if retried:
+                    all_translations.update(retried)
+                else:
+                    logger.error("Batch %d failed even after sub-batch retry: %s", batch_num, error_msg)
+
+        # v1.1.3: Check coverage after retries — fail if below configured threshold
+        if protected_texts:
+            translated_ratio = len(all_translations) / max(1, len(protected_texts))
+            min_coverage = self.config.min_translation_coverage
+            logger.info(
+                "Translation batches: %d total, %d succeeded, %d failed, "
+                "%d strings translated out of %d (%.1f%%), threshold=%.0f%%",
+                total_batches,
+                total_batches - len(failed_batches),
+                len(failed_batches),
+                len(all_translations),
+                len(protected_texts),
+                translated_ratio * 100,
+                min_coverage * 100,
+            )
+            if translated_ratio < min_coverage and failed_batches:
                 raise RuntimeError(
-                    f"FATAL: ALL {total} GPT translation batches failed. "
-                    f"Errors: {'; '.join(self._report.errors[-3:])}"
+                    f"Translation incomplete: only {translated_ratio:.1%} of strings translated "
+                    f"(threshold: {min_coverage:.0%}). "
+                    f"Failed batches: {[b[0] for b in failed_batches]}"
                 )
-            logger.error(
-                "%d/%d GPT batches failed — proceeding with partial results. "
-                "Failed: %s. Translated %d/%d strings.",
-                len(failed_batches), total, failed_batches,
-                len(all_translations), len(protected_texts),
-            )
-            self._report.errors.append(
-                f"{len(failed_batches)}/{total} batches failed, partial results used"
-            )
 
         return all_translations
+
+    def _retry_with_smaller_chunks(
+        self,
+        renumbered: Dict[str, str],
+        idx_map: Dict[str, str],
+        batch_num: int,
+    ) -> Dict[str, str]:
+        """Retry a failed batch by splitting into smaller sub-batches.
+
+        Splits the failed batch into progressively smaller chunks (20 → 10 → 5 → 1)
+        and re-sends each to GPT. Index mapping is hardened with bounds checking
+        and type validation to handle malformed LLM responses.
+        """
+        items = list(renumbered.items())
+        for sub_size in [20, 10, 5, 1]:
+            merged: Dict[str, str] = {}
+            all_ok = True
+            for start in range(0, len(items), sub_size):
+                sub = dict(items[start:start + sub_size])
+                # Re-number 1..N for GPT
+                sub_renumbered = {str(i + 1): v for i, (_, v) in enumerate(sub.items())}
+                sub_keys = list(sub.keys())
+                try:
+                    sub_result = self.gpt.translate_batch(sub_renumbered)
+                    if not isinstance(sub_result, dict):
+                        logger.warning(
+                            "Sub-batch returned non-dict: %s", type(sub_result).__name__
+                        )
+                        all_ok = False
+                        break
+                    # Map back to original indices with hardened bounds checking
+                    for sub_idx, arabic in sub_result.items():
+                        try:
+                            idx_int = int(sub_idx)
+                        except (ValueError, TypeError):
+                            logger.warning(
+                                "Sub-batch returned non-numeric key '%s' — skipping",
+                                sub_idx,
+                            )
+                            continue
+                        if 1 <= idx_int <= len(sub_keys):
+                            original_batch_idx = sub_keys[idx_int - 1]
+                        else:
+                            logger.warning(
+                                "Sub-batch index %d out of range [1..%d] — skipping",
+                                idx_int, len(sub_keys),
+                            )
+                            continue
+                        orig_idx = idx_map.get(
+                            str(original_batch_idx), str(original_batch_idx)
+                        )
+                        merged[orig_idx] = arabic
+                except Exception as e:
+                    logger.warning("Sub-batch (size=%d) failed: %s", sub_size, e)
+                    all_ok = False
+                    break
+            if all_ok and merged:
+                logger.info(
+                    "Batch %d recovered with sub-batch size %d: %d/%d strings",
+                    batch_num, sub_size, len(merged), len(items),
+                )
+                return merged
+        return {}
 
     # ─────────────────────────────────────────────────────────────────────
     # Claude QA Pass

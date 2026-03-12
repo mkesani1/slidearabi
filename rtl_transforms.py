@@ -215,20 +215,14 @@ class MasterLayoutTransformer:
 
     def _apply_rtl_direction_defaults(self, xml_element) -> int:
         """
-        Set direction defaults on master/layout elements.
+        Set default RTL direction on master/layout elements.
 
-        Round 2 fix: Do NOT set rtl='1' at master/layout level.
-        Setting rtl='1' in inherited paragraph properties causes ALL text
-        (including English) to be treated as bidi RTL, which corrupts
-        period placement and word order in English text.
+        - bodyPr → rtlCol="1" (column order)
+        - defPPr → rtl="1" (default paragraph direction)
+        - lstStyle/lvlNpPr → rtl="1" (list level paragraph direction)
 
-        Instead:
-        - rtlCol='1' on bodyPr is safe (controls column direction, not text)
-        - rtl on lstStyle/defPPr is NOT set (slide-level _set_rtl_alignment_unconditional
-          handles this per-paragraph based on actual script detection)
-
-        Critical: NO algn writes here — alignment is context-sensitive and
-        must be set at the slide paragraph level only.
+        CRITICAL: Do NOT set algn here — alignment is context-sensitive
+        and must be set per-paragraph at slide level.
         """
         changes = 0
 
@@ -237,9 +231,17 @@ class MasterLayoutTransformer:
             body_pr.set('rtlCol', '1')
             changes += 1
 
-        # DO NOT set rtl='1' on lstStyle or defPPr — this is handled
-        # per-paragraph at slide level based on actual script content.
-        # The old code set rtl='1' here which caused English text corruption.
+        # defPPr → rtl="1" (default paragraph direction, but NOT algn)
+        for def_ppr in xml_element.iter(f'{{{A_NS}}}defPPr'):
+            def_ppr.set('rtl', '1')
+            changes += 1
+
+        # lstStyle/lvlNpPr → rtl="1" (list level direction, but NOT algn)
+        for lst_style in xml_element.iter(f'{{{A_NS}}}lstStyle'):
+            for child in lst_style:
+                if child.tag.startswith(f'{{{A_NS}}}lvl') and child.tag.endswith('pPr'):
+                    child.set('rtl', '1')
+                    changes += 1
 
         return changes
 
@@ -255,11 +257,9 @@ class MasterLayoutTransformer:
         """
         Set RTL-related defaults in the master's txStyles element.
 
-        Round 2 fix: Do NOT set rtl='1' on txStyles paragraph properties.
-        This caused English text corruption (period displacement, word reordering).
-
-        Only set language defaults on defRPr for Arabic font selection.
-        RTL direction is handled per-paragraph at slide level.
+        Sets rtl='1' on txStyles lvlNpPr for default RTL direction,
+        and lang='ar-SA' on defRPr for Arabic font selection.
+        Does NOT set algn — alignment is per-paragraph at slide level.
         """
         changes = 0
         try:
@@ -274,8 +274,10 @@ class MasterLayoutTransformer:
                     continue
                 for level in range(1, 10):
                     for lvl_pPr in style_elem.findall(f'{{{A_NS}}}lvl{level}pPr'):
-                        # DO NOT set rtl='1' here — causes English text corruption.
-                        # Only set language for Arabic font selection
+                        # Set rtl='1' for default paragraph direction (not algn)
+                        lvl_pPr.set('rtl', '1')
+                        changes += 1
+                        # Set language for Arabic font selection
                         defRPr = lvl_pPr.find(f'{{{A_NS}}}defRPr')
                         if defRPr is not None:
                             defRPr.set('lang', 'ar-SA')
@@ -856,7 +858,23 @@ class SlideContentTransformer:
                             changes += self._transform_table_rtl(child)
                         if getattr(child, 'has_chart', False) and child.has_chart:
                             changes += self._transform_chart_rtl(child)
+                    # Fix 4B: Directional reversal for group children (arrows, connectors)
+                    if hasattr(shape, 'shapes'):
+                        for child in shape.shapes:
+                            changes += self._reverse_directional_shape(child)
+                            changes += self._reverse_connector_direction(child)
+                            changes += self._reverse_line_arrowheads(child)
                     continue
+
+                # Fix 4A: Handle connector shapes (cxnSp)
+                sp_el = shape._element
+                if sp_el.tag.endswith('}cxnSp') or sp_el.tag == 'cxnSp':
+                    changes += self._reverse_connector_direction(shape)
+                    # Also mirror position
+                    if self._should_mirror_shape(shape, layout_type):
+                        if self._mirror_freeform_shape(shape, self._slide_width):
+                            changes += 1
+                    continue  # Connectors don't need text treatment
 
                 if getattr(shape, 'is_placeholder', False):
                     # Placeholder: remove local position override to inherit
@@ -932,6 +950,22 @@ class SlideContentTransformer:
 
         # Fix 9: Collision detection (log warnings for overlapping shapes)
         self._detect_collisions(all_shapes, slide_number)
+
+        # v1.1.3: Per-slide translation coverage telemetry
+        translated_shapes = 0
+        total_text_shapes = 0
+        for s in all_shapes:
+            if getattr(s, 'has_text_frame', False) and any(
+                p.text.strip() for p in s.text_frame.paragraphs if p.text
+            ):
+                total_text_shapes += 1
+                if any(has_arabic(p.text) for p in s.text_frame.paragraphs if p.text):
+                    translated_shapes += 1
+        if total_text_shapes > 0 and translated_shapes == 0:
+            logger.error(
+                'Slide %d: 0/%d text shapes translated — possible extraction miss',
+                slide_number, total_text_shapes,
+            )
 
         return changes
 
@@ -1436,12 +1470,18 @@ class SlideContentTransformer:
         try:
             slide_width = self._slide_width
 
+            # Layout-specific rules (checked first — before positional checks)
+            # secHead/title layouts are typically centered/symmetrical by design;
+            # never mirror their shapes.
+            if layout_type in ('secHead', 'title'):
+                return False
+
             # Full-width background shapes: never mirror
             width = getattr(shape, 'width', None)
             if width is not None and width > slide_width * 0.90:
                 return False
 
-            # Fix 3: Footer-zone shapes — ALWAYS mirror regardless of layout
+            # Footer-zone shapes — ALWAYS mirror regardless of layout
             top = getattr(shape, 'top', None)
             height = getattr(shape, 'height', None)
             if top is not None and height is not None:
@@ -1449,18 +1489,6 @@ class SlideContentTransformer:
                 slide_height = self._slide_height
                 if bottom > slide_height * 0.88:
                     return True  # Footer zone — always mirror
-
-            # Layout-specific rules
-            # Fix 2: secHead/title layouts — only skip large decorative backgrounds,
-            # still mirror text boxes and content shapes
-            if layout_type in ('secHead', 'title'):
-                # Only skip large background decorative shapes (>50% of slide width)
-                width = getattr(shape, 'width', None)
-                if width is not None and width > slide_width * 0.50:
-                    # Large shape — likely decorative background, skip
-                    return False
-                # Smaller shapes on secHead/title — mirror them
-                return True
 
             # By default, mirror content-sized shapes
             return True
@@ -1665,9 +1693,9 @@ class SlideContentTransformer:
             return 'l'
 
         # Title placeholders: center-align (preserve original design intent)
-        # Match 'title (1)', 'center_title (3)', 'vertical_title (5)'
+        # Match 'title (1)', 'center_title (3)', 'vertical_title (5)', 'ctrTitle'
         # but NOT 'subtitle (4)' — subtitles are body-like
-        if ph_type and ('subtitle' not in ph_type) and any(t in ph_type for t in ('title',)):
+        if ph_type and ('subtitle' not in ph_type.lower()) and ('title' in ph_type.lower()):
             return 'ctr'
 
         ratios = compute_script_ratio(text)
@@ -1677,8 +1705,8 @@ class SlideContentTransformer:
         if arabic_ratio > 0.70:
             return 'r'
         elif latin_ratio > 0.70 and not has_arabic(text):
-            # Fix 1: Pure Latin text — still right-align in RTL context
-            return 'r'
+            # Pure Latin text should remain left-aligned
+            return 'l'
         else:
             # Mixed content or ambiguous — default to right in Arabic context
             return 'r'
@@ -1831,6 +1859,17 @@ class SlideContentTransformer:
         except Exception as exc:
             logger.warning('_transform_table_rtl on "%s": %s',
                            getattr(shape, 'name', '?'), exc)
+
+        # v1.1.3: Table transform telemetry
+        try:
+            logger.info(
+                'Table RTL on "%s": %d cols, %d rows, tblPr.rtl=%s, changes=%d',
+                getattr(shape, 'name', '?'), num_cols, len(table.rows),
+                tbl_pr.get('rtl', 'not set') if tbl_pr is not None else 'no tblPr',
+                changes,
+            )
+        except Exception:
+            pass
 
         return changes
 
@@ -3704,4 +3743,81 @@ class SlideContentTransformer:
         except Exception as exc:
             logger.debug('_reverse_directional_shape: %s', exc)
         return 0
+
+    def _reverse_connector_direction(self, shape) -> int:
+        """Reverse connector arrow direction for RTL by swapping headEnd/tailEnd markers."""
+        try:
+            sp_el = shape._element
+            if not (sp_el.tag.endswith('}cxnSp') or sp_el.tag == 'cxnSp'):
+                return 0
+
+            a_ns = A_NS
+            ln = sp_el.find(f'.//{{{a_ns}}}ln')
+            if ln is None:
+                return 0
+
+            head = ln.find(f'{{{a_ns}}}headEnd')
+            tail = ln.find(f'{{{a_ns}}}tailEnd')
+
+            if head is None and tail is None:
+                return 0
+
+            head_copy = deepcopy(head) if head is not None else None
+            tail_copy = deepcopy(tail) if tail is not None else None
+
+            if head is not None:
+                ln.remove(head)
+            if tail is not None:
+                ln.remove(tail)
+
+            # Swap: old tail becomes new head, old head becomes new tail
+            if tail_copy is not None:
+                tail_copy.tag = f'{{{a_ns}}}headEnd'
+                ln.append(tail_copy)
+            if head_copy is not None:
+                head_copy.tag = f'{{{a_ns}}}tailEnd'
+                ln.append(head_copy)
+
+            logger.debug("Reversed connector arrowheads on %s", getattr(shape, 'name', '?'))
+            return 1
+        except (AttributeError, KeyError, ValueError, TypeError) as exc:
+            logger.debug('_reverse_connector_direction: %s on %s', exc, getattr(shape, 'name', '?'))
+            return 0
+
+    def _reverse_line_arrowheads(self, shape) -> int:
+        """Swap head/tail arrowhead markers on line shapes for RTL flow."""
+        try:
+            sp_el = shape._element
+            a_ns = A_NS
+            ln = sp_el.find(f'.//{{{a_ns}}}ln')
+            if ln is None:
+                return 0
+
+            head_end = ln.find(f'{{{a_ns}}}headEnd')
+            tail_end = ln.find(f'{{{a_ns}}}tailEnd')
+
+            if head_end is None and tail_end is None:
+                return 0
+
+            head_attribs = dict(head_end.attrib) if head_end is not None else None
+            tail_attribs = dict(tail_end.attrib) if tail_end is not None else None
+
+            if head_end is not None:
+                ln.remove(head_end)
+            if tail_end is not None:
+                ln.remove(tail_end)
+
+            if tail_attribs:
+                new_head = etree.SubElement(ln, f'{{{a_ns}}}headEnd')
+                for k, v in tail_attribs.items():
+                    new_head.set(k, v)
+            if head_attribs:
+                new_tail = etree.SubElement(ln, f'{{{a_ns}}}tailEnd')
+                for k, v in head_attribs.items():
+                    new_tail.set(k, v)
+
+            return 1
+        except (AttributeError, KeyError, ValueError, TypeError) as exc:
+            logger.debug('_reverse_line_arrowheads: %s on %s', exc, getattr(shape, 'name', '?'))
+            return 0
 
