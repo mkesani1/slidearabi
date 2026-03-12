@@ -24,7 +24,8 @@ WORKDIR /app
 
 # Copy requirements first (layer caching)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# v1.1.3: force fastmcp==3.1.0 for MCP server support
+RUN pip install --no-cache-dir -r requirements.txt && pip show fastmcp | head -2
 
 # Copy ONLY Python source files into the package (see .dockerignore)
 COPY . /app/slidearabi/
