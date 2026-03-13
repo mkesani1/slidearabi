@@ -561,12 +561,68 @@ class MasterLayoutTransformer:
                         continue
                     if abs(new_left - left) < _POSITION_TOLERANCE_EMU:
                         continue
-                    shape.left = new_left
+                    # Fix 21: Ensure full xfrm geometry is written when mirroring
+                    # layout placeholders. python-pptx's shape.left setter creates
+                    # a partial xfrm (off with only x) when the layout had no local
+                    # xfrm. This causes y/cy to be lost, collapsing all placeholders
+                    # to y=0. We write the complete xfrm explicitly.
+                    self._set_layout_placeholder_position(
+                        shape, new_left, shape.top, shape.width, shape.height
+                    )
                     changes += 1
                 except Exception as exc:
                     logger.debug('_mirror_layout_placeholders: %s', exc)
 
         return changes
+
+    def _set_layout_placeholder_position(
+        self, shape, new_left, top, width, height
+    ) -> None:
+        """
+        Fix 21: Write complete xfrm geometry on a layout placeholder.
+
+        When a layout placeholder has no local xfrm (inherits all geometry
+        from the slide master), python-pptx's `shape.left = value` setter
+        creates a minimal xfrm with only `<a:off x="..."/>`, omitting y, cx,
+        and cy. This causes PowerPoint/LibreOffice to position ALL placeholders
+        at y=0 with zero height — producing title/body overlap.
+
+        This method reads the inherited geometry, writes a complete xfrm with
+        the mirrored x and all original y/cx/cy values preserved.
+        """
+        sp_el = shape._element
+        sp_pr = sp_el.find(f'{{{P_NS}}}spPr')
+        if sp_pr is None:
+            sp_pr = etree.SubElement(sp_el, f'{{{P_NS}}}spPr')
+
+        # Get or create xfrm
+        xfrm = sp_pr.find(f'{{{A_NS}}}xfrm')
+        if xfrm is None:
+            xfrm = etree.SubElement(sp_pr, f'{{{A_NS}}}xfrm')
+            # Insert xfrm as the first child of spPr
+            sp_pr.insert(0, xfrm)
+
+        # Get or create off element
+        off = xfrm.find(f'{{{A_NS}}}off')
+        if off is None:
+            off = etree.SubElement(xfrm, f'{{{A_NS}}}off')
+
+        # Get or create ext element
+        ext = xfrm.find(f'{{{A_NS}}}ext')
+        if ext is None:
+            ext = etree.SubElement(xfrm, f'{{{A_NS}}}ext')
+
+        # Write all four position values
+        off.set('x', str(int(new_left)))
+        off.set('y', str(int(top) if top is not None else 0))
+        ext.set('cx', str(int(width) if width is not None else 0))
+        ext.set('cy', str(int(height) if height is not None else 0))
+
+        logger.debug(
+            'Fix 21: wrote full xfrm on layout PH "%s": x=%s y=%s cx=%s cy=%s',
+            getattr(shape, 'name', '?'),
+            off.get('x'), off.get('y'), ext.get('cx'), ext.get('cy'),
+        )
 
     def _swap_two_column_placeholders(self, layout, slide_width: int) -> int:
         """
@@ -926,6 +982,11 @@ class SlideContentTransformer:
 
         # Fix 12: Resolve title-body vertical overlap for RTL
         changes += self._fix_title_body_overlap(all_shapes, slide_number)
+
+        # Fix 22: Apply normAutofit to all Arabic-containing placeholder text frames.
+        # Arabic text is 20-40% taller/wider than English at the same font size.
+        # Without autofit, text overflows the placeholder box and overlaps adjacent shapes.
+        changes += self._apply_arabic_autofit(all_shapes, slide_number)
 
         # Fix 14: Right-anchor cover title text for photo-background covers
         changes += self._fix_cover_title_anchor(all_shapes, slide_number)
@@ -2558,6 +2619,161 @@ class SlideContentTransformer:
                             )
                 except Exception as exc:
                     logger.debug('Fix 12: %s', exc)
+
+        return changes
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Fix 22: Post-translation Arabic autofit
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _apply_arabic_autofit(self, shapes: list, slide_number: int) -> int:
+        """
+        Fix 22: Apply normAutofit to all text frames containing Arabic text.
+
+        Arabic text is typically 20-40% wider and often taller (due to diacritics)
+        than the English source at the same font size. Without autofit, text
+        overflows the placeholder bounding box and collides with adjacent shapes.
+
+        Two-pronged approach for maximum compatibility:
+        1. Set <a:normAutofit fontScale="..."/> on bodyPr (PowerPoint respects this)
+        2. Directly reduce font sizes on runs (LibreOffice ignores normAutofit in
+           headless PDF export, so we must also reduce actual font sizes)
+
+        Only applies to shapes that:
+        - Have a text frame with Arabic content
+        - Don't already have normAutofit set
+        - Have text that plausibly overflows (estimated from character count vs box width)
+
+        Returns:
+            Count of shapes modified.
+        """
+        changes = 0
+
+        for shape in shapes:
+            try:
+                if not getattr(shape, 'has_text_frame', False):
+                    continue
+                tf = shape.text_frame
+                shape_text = tf.text or ''
+                if not has_arabic(shape_text):
+                    continue
+
+                body_pr = tf._txBody.find(f'{{{A_NS}}}bodyPr')
+                if body_pr is None:
+                    continue
+
+                # Skip if normAutofit is already set
+                existing = body_pr.find(f'{{{A_NS}}}normAutofit')
+                if existing is not None:
+                    continue
+
+                # Estimate whether text overflows its box.
+                # Heuristic: Arabic text at the same font size needs ~30% more
+                # horizontal space. Count characters and compare to box width.
+                box_width_emu = None
+                box_height_emu = None
+                try:
+                    if shape.width is not None:
+                        box_width_emu = int(shape.width)
+                    if shape.height is not None:
+                        box_height_emu = int(shape.height)
+                except (TypeError, ValueError):
+                    pass
+
+                # Get max font size in this shape (hundredths of a point)
+                max_font_hundredths = 0
+                for rPr in shape._element.iter(f'{{{A_NS}}}rPr'):
+                    sz_str = rPr.get('sz')
+                    if sz_str:
+                        try:
+                            max_font_hundredths = max(max_font_hundredths, int(sz_str))
+                        except ValueError:
+                            pass
+                for def_rPr in shape._element.iter(f'{{{A_NS}}}defRPr'):
+                    sz_str = def_rPr.get('sz')
+                    if sz_str:
+                        try:
+                            max_font_hundredths = max(max_font_hundredths, int(sz_str))
+                        except ValueError:
+                            pass
+
+                # Rough overflow estimate:
+                # A character at N pt takes approximately N * 635 EMU width (monospace approx).
+                # Arabic is ~1.3x wider. If estimated text width > box width, it overflows.
+                char_count = len(shape_text.replace('\n', ''))
+                if max_font_hundredths > 0 and box_width_emu and box_width_emu > 0:
+                    font_pt = max_font_hundredths / 100
+                    # Rough: each Arabic char takes ~0.6 * font_size_pt * 12700 EMU
+                    estimated_char_width_emu = 0.6 * font_pt * 12700
+                    # Count lines (by newlines) and estimate per-line width
+                    lines = shape_text.split('\n')
+                    max_line_chars = max(len(l.strip()) for l in lines) if lines else char_count
+                    estimated_line_width = max_line_chars * estimated_char_width_emu * 1.3  # Arabic expansion
+                    overflow_ratio = estimated_line_width / box_width_emu
+
+                    # Also estimate height overflow
+                    line_count = len(lines)
+                    estimated_line_height_emu = font_pt * 12700 * 1.5  # 1.5x line spacing
+                    estimated_total_height = line_count * estimated_line_height_emu
+                    height_overflow = (estimated_total_height / box_height_emu) if box_height_emu else 0
+
+                    # Only apply autofit if text plausibly overflows
+                    if overflow_ratio < 0.9 and height_overflow < 0.9:
+                        continue
+
+                    # Calculate appropriate font scale
+                    max_overflow = max(overflow_ratio, height_overflow)
+                    # fontScale: 100000 = 100%. Minimum 50000 = 50%.
+                    font_scale = max(int(100000 / max_overflow), 50000)
+                    font_scale = min(font_scale, 100000)  # Don't exceed 100%
+                else:
+                    # Can't estimate — apply conservative autofit (90% scale)
+                    font_scale = 90000
+
+                # Remove any existing autofit variants
+                for child_tag in ('spAutoFit', 'noAutofit'):
+                    for child in body_pr.findall(f'{{{A_NS}}}{child_tag}'):
+                        body_pr.remove(child)
+
+                # Add normAutofit
+                autofit_el = etree.SubElement(body_pr, f'{{{A_NS}}}normAutofit')
+                autofit_el.set('fontScale', str(font_scale))
+
+                # Also directly scale font sizes on runs for LibreOffice compatibility
+                font_scale_ratio = font_scale / 100000
+                for para in tf.paragraphs:
+                    for run in para.runs:
+                        if run.font.size is not None:
+                            original_size = int(run.font.size)
+                            new_size = max(int(original_size * font_scale_ratio), 8 * 12700)  # min 8pt
+                            run.font.size = new_size
+                        else:
+                            # Read default font size from defRPr or endParaRPr
+                            rPr = run._r.find(f'{{{A_NS}}}rPr')
+                            if rPr is None:
+                                rPr = etree.SubElement(run._r, f'{{{A_NS}}}rPr')
+                                run._r.insert(0, rPr)
+                            default_sz = None
+                            for src in [para._p.find(f'.//{{{A_NS}}}defRPr'),
+                                        para._p.find(f'{{{A_NS}}}endParaRPr')]:
+                                if src is not None and src.get('sz'):
+                                    try:
+                                        default_sz = int(src.get('sz'))
+                                    except ValueError:
+                                        pass
+                                    break
+                            if default_sz:
+                                new_sz = max(int(default_sz * font_scale_ratio), 800)
+                                rPr.set('sz', str(new_sz))
+
+                changes += 1
+                logger.debug(
+                    'Fix 22 slide %d: autofit on "%s" fontScale=%d%%',
+                    slide_number, getattr(shape, 'name', '?'), font_scale // 1000,
+                )
+
+            except Exception as exc:
+                logger.debug('Fix 22 slide %d: %s', slide_number, exc)
 
         return changes
 

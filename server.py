@@ -109,7 +109,7 @@ VALID_PROMO_CODES: Dict[str, str] = {
 }
 
 
-app = FastAPI(title="SlideArabi API", version="1.1.3")
+app = FastAPI(title="SlideArabi API", version="1.1.4")
 
 
 # === STARTUP DIAGNOSTIC — remove after Railway deploy is stable ===
@@ -940,7 +940,7 @@ def health():
         }
         if _mcp_error:
             agent_stack["mcp_error"] = _mcp_error
-        return {"status": "ok", "version": "1.1.3", "agent_stack": agent_stack}
+        return {"status": "ok", "version": "1.1.4", "agent_stack": agent_stack}
     except Exception as exc:
         logger.exception("/health failed: %s", exc)
         raise HTTPException(status_code=500, detail="Internal server error")
