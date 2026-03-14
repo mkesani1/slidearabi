@@ -1,0 +1,21 @@
+# Smithery configuration file: https://smithery.ai/docs/config#smitheryyaml
+# SlideArabi MCP Server - Smithery listing configuration
+
+startCommand:
+  type: http
+  url: https://slidearabi-production.up.railway.app/mcp
+  configSchema:
+    type: object
+    required:
+      - apiKey
+    properties:
+      apiKey:
+        type: string
+        description: "Your SlideArabi API key (format: sa_live_xxx). Get one at https://www.slidearabi.com"
+  commandFunction: |-
+    (config) => ({
+      url: "https://slidearabi-production.up.railway.app/mcp",
+      headers: {
+        "Authorization": `Bearer ${config.apiKey}`
+      }
+    })

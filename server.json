@@ -1,0 +1,26 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.mkesani1/slidearabi",
+  "title": "SlideArabi",
+  "description": "AI-powered English to Arabic PowerPoint conversion with full RTL layout transformation, chart mirroring, and professional Arabic typography",
+  "version": "1.0.0",
+  "repository": {
+    "url": "https://github.com/mkesani1/slidearabi",
+    "source": "github"
+  },
+  "websiteUrl": "https://www.slidearabi.com",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://slidearabi-production.up.railway.app/mcp",
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Bearer token for authentication. Format: 'Bearer sa_live_xxx'. Obtain your API key at https://www.slidearabi.com",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
