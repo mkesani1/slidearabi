@@ -504,9 +504,9 @@ def bounds_check_emu(value: int, slide_dimension: int, label: str = '') -> bool:
     """
     Check whether a position value is within reasonable slide bounds.
 
-    Allows for a small negative margin (−200 000 EMU ≈ −0.22 in) for shapes
-    that deliberately bleed off the slide edge, and an extra positive margin
-    (500 000 EMU ≈ 0.55 in) beyond the slide dimension.
+    Allows for a generous negative margin (−1 500 000 EMU ≈ −1.64 in) for shapes
+    that deliberately bleed off the slide edge (common in professional designs),
+    and an equivalent positive margin beyond the slide dimension.
 
     Args:
         value: Position value in EMU to validate.
@@ -516,14 +516,17 @@ def bounds_check_emu(value: int, slide_dimension: int, label: str = '') -> bool:
     Returns:
         True if the value is within acceptable bounds, False otherwise.
     """
-    lower = -200_000
-    upper = slide_dimension + 500_000
+    lower = -1_500_000
+    upper = slide_dimension + 1_500_000
     return lower <= value <= upper
 
 
 def clamp_emu(value: int, slide_dimension: int) -> int:
     """
-    Clamp a position or size value to the range [-200_000, slide_dimension + 500_000].
+    Clamp a position or size value to the range [-1_500_000, slide_dimension + 1_500_000].
+
+    Generous bounds accommodate intentional design bleeds (shapes extending
+    past slide edges) which are common in professional presentations.
 
     Args:
         value: EMU value to clamp.
@@ -532,6 +535,6 @@ def clamp_emu(value: int, slide_dimension: int) -> int:
     Returns:
         Clamped EMU value.
     """
-    lower = -200_000
-    upper = slide_dimension + 500_000
+    lower = -1_500_000
+    upper = slide_dimension + 1_500_000
     return max(lower, min(upper, value))
