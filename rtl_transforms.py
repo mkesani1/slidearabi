@@ -895,6 +895,8 @@ class SlideContentTransformer:
             all_shapes, slide_number, panel_handled_shapes
         )
 
+        individually_mirrored_shapes = set()  # shape ids mirrored by per-shape loop
+
         for shape in all_shapes:
             try:
                 # Fix 5: Handle group shapes as a single unit
@@ -904,6 +906,7 @@ class SlideContentTransformer:
                         if self._should_mirror_shape(shape, layout_type):
                             if self._mirror_freeform_shape(shape, self._slide_width):
                                 changes += 1
+                                individually_mirrored_shapes.add(id(shape))
                     # Process text in group children (no position mirroring)
                     for child in self._collect_text_shapes_from_group(shape):
                         changes += self._apply_translation(child, self.translations)
@@ -948,6 +951,7 @@ class SlideContentTransformer:
                     if self._should_mirror_shape(shape, layout_type):
                         if self._mirror_freeform_shape(shape, self._slide_width):
                             changes += 1
+                            individually_mirrored_shapes.add(id(shape))
                     # Fix 10: Reverse directional shapes (chevrons, arrows)
                     changes += self._reverse_directional_shape(shape)
 
@@ -992,7 +996,14 @@ class SlideContentTransformer:
         changes += self._fix_cover_title_anchor(all_shapes, slide_number)
 
         # Fix 15: Mirror split-panel layouts (image-left/text-right → image-right/text-left)
-        changes += self._mirror_split_panel_layout(all_shapes, slide_number)
+        # Skip if pre-mirror panel swap already handled this slide — otherwise
+        # Fix 15 would detect the already-swapped panels and reverse them.
+        # Also skip if panel-candidate shapes were already individually mirrored
+        # by the per-shape loop (e.g. content-aware gating on title layouts).
+        if panel_swap_delta == 0:
+            changes += self._mirror_split_panel_layout(
+                all_shapes, slide_number, individually_mirrored_shapes
+            )
 
         # Fix 16: Reverse timeline alternation pattern for RTL
         changes += self._reverse_timeline_alternation(all_shapes, slide_number)
@@ -1406,10 +1417,13 @@ class SlideContentTransformer:
 
             new_left = mirror_x(left, width, slide_width_emu)
 
-            # Round 3: Tighter clamping — prevent edge clipping
-            # Allow minimal bleed (-100000 EMU ≈ 0.11") for intentional edge shapes
-            MIN_BLEED = -100_000
-            MAX_BLEED = 100_000
+            # Round 3 + Round 7: Symmetric bleed clamping.
+            # Intentional bleeds (shapes extending past slide edges) are common
+            # in professional designs. When mirroring, a left-bleed should
+            # become a right-bleed and vice versa. Allow up to ~1.64" bleed
+            # to accommodate standard print/design bleed patterns.
+            MIN_BLEED = -1_500_000   # ~-1.64" — accommodate intentional left-bleed
+            MAX_BLEED = 1_500_000    # ~+1.64" — accommodate intentional right-bleed
             if new_left < MIN_BLEED:
                 new_left = MIN_BLEED
             if width is not None and new_left + width > slide_width_emu + MAX_BLEED:
@@ -1531,11 +1545,30 @@ class SlideContentTransformer:
         try:
             slide_width = self._slide_width
 
-            # Layout-specific rules (checked first — before positional checks)
-            # secHead/title layouts are typically centered/symmetrical by design;
-            # never mirror their shapes.
+            # Layout-specific rules for title/secHead layouts.
+            # These are often symmetrical with decorative brand elements that
+            # should NOT be mirrored. But they also contain content images,
+            # photo panels, and illustration groups that MUST be mirrored.
+            # Strategy: mirror content-sized shapes (>20% width AND >30% height)
+            # but preserve small decorative elements (accent bars, brand marks).
             if layout_type in ('secHead', 'title'):
-                return False
+                width = getattr(shape, 'width', None)
+                height = getattr(shape, 'height', None)
+                if width is None or height is None:
+                    return False
+                w, h = int(width), int(height)
+                # Full-width backgrounds: never mirror (also caught below)
+                if w > self._slide_width * 0.90:
+                    return False
+                # Content-sized shapes: images, groups, or large panels
+                # that define the visual structure of the slide.
+                is_content_sized = (
+                    w > self._slide_width * 0.20
+                    and h > self._slide_height * 0.30
+                )
+                if is_content_sized:
+                    return True  # Mirror this content element
+                return False  # Small decorative element — don't mirror
 
             # Full-width background shapes: never mirror
             width = getattr(shape, 'width', None)
@@ -2717,8 +2750,15 @@ class SlideContentTransformer:
                     estimated_total_height = line_count * estimated_line_height_emu
                     height_overflow = (estimated_total_height / box_height_emu) if box_height_emu else 0
 
-                    # Only apply autofit if text plausibly overflows
-                    if overflow_ratio < 0.9 and height_overflow < 0.9:
+                    # Only apply autofit if text plausibly overflows.
+                    # For large font sizes (>=24pt / 2400 hundredths) in wide
+                    # boxes (>40% slide width), raise the threshold — the
+                    # character-width estimation is less reliable at display
+                    # sizes and doesn't account for word-wrap.
+                    threshold = 0.9
+                    if max_font_hundredths >= 2400 and box_width_emu > self._slide_width * 0.40:
+                        threshold = 1.2  # Require 20% overflow before intervening
+                    if overflow_ratio < threshold and height_overflow < threshold:
                         continue
 
                     # Calculate appropriate font scale
@@ -2906,6 +2946,11 @@ class SlideContentTransformer:
             # Step 2: Find title-like text shapes in the LEFT half
             for shape in shapes:
                 try:
+                    # Placeholders are already positioned by the placeholder
+                    # pipeline (_remove_local_position_override).  Fix 14 is
+                    # only for freeform title text boxes placed by designers.
+                    if getattr(shape, 'is_placeholder', False):
+                        continue
                     if not getattr(shape, 'has_text_frame', False):
                         continue
                     left = getattr(shape, 'left', None)
@@ -3194,7 +3239,8 @@ class SlideContentTransformer:
 
         return 0
 
-    def _mirror_split_panel_layout(self, shapes: list, slide_number: int) -> int:
+    def _mirror_split_panel_layout(self, shapes: list, slide_number: int,
+                                       individually_mirrored: set = None) -> int:
         """
         Fix 15: For split-panel slides (image-left / text-right or vice versa),
         swap the two halves so the reading flow is correct for RTL.
@@ -3247,6 +3293,16 @@ class SlideContentTransformer:
 
             left_shape = left_panels[0]
             right_shape = right_panels[0]
+
+            # Skip if either panel candidate was already individually mirrored
+            # by the per-shape loop — swapping would reverse the correct result.
+            if individually_mirrored:
+                if id(left_shape) in individually_mirrored or id(right_shape) in individually_mirrored:
+                    logger.debug(
+                        'Fix 15 slide %d: skipped — panel candidate(s) already '
+                        'individually mirrored', slide_number
+                    )
+                    return 0
 
             # Check that they're different types (one image, one text/container)
             left_is_image = left_shape._element.tag.endswith('}pic')
