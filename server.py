@@ -59,6 +59,24 @@ del _env_var, _val
 PIPELINE_SEMAPHORE = threading.Semaphore(1)
 JOBS_LOCK = threading.Lock()
 
+# ── Pending job queue: jobs wait here when the semaphore is busy ─────────────
+import queue as _queue_mod
+PENDING_QUEUE: _queue_mod.Queue = _queue_mod.Queue(maxsize=10)
+
+def _queue_dispatcher() -> None:
+    """Background thread that drains the pending queue sequentially."""
+    while True:
+        job_id = PENDING_QUEUE.get()  # blocks until a job appears
+        try:
+            _run_pipeline_worker(job_id)
+        except Exception as exc:
+            logger.exception("Queue dispatcher failed for %s: %s", job_id, exc)
+        finally:
+            PENDING_QUEUE.task_done()
+
+_dispatcher_thread = threading.Thread(target=_queue_dispatcher, daemon=True)
+_dispatcher_thread.start()
+
 PHASE_EXTRACTING = "extracting"
 PHASE_TRANSLATING = "translating"
 PHASE_RTL = "rtl_transforms"
@@ -677,8 +695,9 @@ async def convert(file: UploadFile = File(...)):
         if len(content) > MAX_FILE_SIZE:
             raise HTTPException(status_code=413, detail="File too large (max 150MB)")
 
-        if PIPELINE_SEMAPHORE._value <= 0:  # best-effort guard before queueing
-            raise HTTPException(status_code=503, detail="Server busy", headers={"Retry-After": "30"})
+        # Reject only if the queue is completely full (10 pending + 1 active)
+        if PENDING_QUEUE.full() and PIPELINE_SEMAPHORE._value <= 0:
+            raise HTTPException(status_code=503, detail="Server busy — too many queued jobs. Please retry in a minute.", headers={"Retry-After": "60"})
 
         job_id = str(uuid.uuid4())
         job_dir = BASE_DIR / job_id
@@ -708,8 +727,15 @@ async def convert(file: UploadFile = File(...)):
         with JOBS_LOCK:
             JOBS[job_id] = job
 
-        # Start immediately for MVP flow (can be gated by payment later via verify-payment)
-        _start_pipeline_if_allowed(job_id)
+        # Try direct start; if semaphore is busy, enqueue for the dispatcher
+        if PIPELINE_SEMAPHORE._value > 0:
+            _start_pipeline_if_allowed(job_id)
+        else:
+            try:
+                PENDING_QUEUE.put_nowait(job_id)
+                logger.info("Job %s queued (pipeline busy, queue depth: %d)", job_id, PENDING_QUEUE.qsize())
+            except _queue_mod.Full:
+                _set_job_state(job_id, status="failed", error="Server overloaded. Please retry in a minute.")
 
         return {"job_id": job_id, "status": "queued", "slide_count": slide_count, "total_slides": slide_count}
     except HTTPException:
