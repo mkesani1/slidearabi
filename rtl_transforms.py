@@ -962,10 +962,13 @@ class SlideContentTransformer:
             all_shapes, slide_number, panel_handled_shapes
         )
 
-        # Fix 24 (logging-only): Detect slide-level shapes that may duplicate
-        # master/layout shapes. Logs but does NOT remove or skip anything.
-        # This data will be reviewed manually before enabling dedup.
-        self._log_master_layout_duplicates(slide, all_shapes, slide_number)
+        # Fix 24 (Round 2: active): Detect slide-level shapes that duplicate
+        # master/layout shapes. Skip mirroring them so the slide-level shape
+        # stays aligned with its master counterpart (prevents duplication or
+        # occlusion after RTL mirror).
+        self._skip_master_layout_duplicates(
+            slide, all_shapes, slide_number, panel_handled_shapes
+        )
 
         individually_mirrored_shapes = set()  # shape ids mirrored by per-shape loop
 
@@ -1068,6 +1071,16 @@ class SlideContentTransformer:
             except Exception as exc:
                 logger.warning('Slide %d shape "%s": %s', slide_number,
                                getattr(shape, 'name', '?'), exc)
+
+        # Fix 25: X-band column coherence for title/secHead layouts.
+        # When title-layout gating mirrors some shapes in a column but skips
+        # shorter ones (failing the h>30% check), force-mirror the stragglers
+        # so the entire column moves together.
+        if layout_type in ('secHead', 'title'):
+            changes += self._force_xband_coherence(
+                all_shapes, individually_mirrored_shapes,
+                panel_handled_shapes, slide_number,
+            )
 
         # Post-mirror: resolve overlaps from independent mirroring.
         # When two shapes that were originally on opposite sides both get
@@ -2860,15 +2873,27 @@ class SlideContentTransformer:
         later in spTree.  If found, move the picture element BEFORE the
         text element so text is visible.
 
-        Safety constraints (5-model consensus, 2026-03-17):
+        Safety constraints (3-model consensus Round 2, 2026-03-17):
         - Only operates on PLACEHOLDER pairs (not freeform shapes)
         - Only reorders <p:pic> and <p:sp> elements
         - Does not touch graphicFrame, cxnSp, or grpSp
+
+        Round 2 fix: When xfrm is absent from slide XML (positions inherited
+        from layout), fall back to python-pptx shape API which resolves the
+        full inheritance chain (slide → layout → master).
         """
         changes = 0
         try:
             spTree = slide.shapes._spTree
             P_NS = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+
+            # Build element → shape lookup for fallback position resolution
+            shape_by_element = {}
+            try:
+                for shape in slide.shapes:
+                    shape_by_element[id(shape._element)] = shape
+            except Exception:
+                pass
 
             # Collect placeholders with position + z-order info
             ph_shapes = []
@@ -2881,18 +2906,41 @@ class SlideContentTransformer:
                 if ph_el is None:
                     continue
                 ph_type = (ph_el.get('type') or '').lower()
-                # Get position
-                xfrm = sp_el.find(f'.//{{{A_NS}}}xfrm')
-                if xfrm is None:
-                    continue
-                off = xfrm.find(f'{{{A_NS}}}off')
-                ext = xfrm.find(f'{{{A_NS}}}ext')
-                if off is None or ext is None:
-                    continue
-                l = int(off.get('x', 0))
-                t = int(off.get('y', 0))
-                w = int(ext.get('cx', 0))
-                h = int(ext.get('cy', 0))
+
+                # Get position — try XML xfrm first, fall back to shape API
+                l = t = w = h = None
+                try:
+                    xfrm = sp_el.find(f'.//{{{A_NS}}}xfrm')
+                    if xfrm is not None:
+                        off = xfrm.find(f'{{{A_NS}}}off')
+                        ext = xfrm.find(f'{{{A_NS}}}ext')
+                        if off is not None and ext is not None:
+                            l = int(off.get('x', 0))
+                            t = int(off.get('y', 0))
+                            w = int(ext.get('cx', 0))
+                            h = int(ext.get('cy', 0))
+                except Exception:
+                    pass
+
+                # Fallback: resolve via python-pptx shape API (handles
+                # layout/master inheritance when xfrm is absent)
+                if l is None or w is None or w <= 0 or h is None or h <= 0:
+                    try:
+                        shape_obj = shape_by_element.get(id(sp_el))
+                        if shape_obj is not None:
+                            sl = getattr(shape_obj, 'left', None)
+                            st = getattr(shape_obj, 'top', None)
+                            sw = getattr(shape_obj, 'width', None)
+                            sh = getattr(shape_obj, 'height', None)
+                            if all(v is not None for v in (sl, st, sw, sh)):
+                                l, t, w, h = int(sl), int(st), int(sw), int(sh)
+                    except Exception:
+                        pass
+
+                if l is None or t is None or w is None or h is None:
+                    continue  # Position unresolvable — skip
+                if w <= 0 or h <= 0:
+                    continue  # Invalid dimensions — skip
 
                 is_picture = tag.endswith('}pic') or ph_type == 'pic'
                 is_text = ph_type in (
@@ -2956,18 +3004,28 @@ class SlideContentTransformer:
         return changes
 
     # ─────────────────────────────────────────────────────────────────────
-    # Fix 24: Logo/shape dedup — logging-only pass
+    # Fix 24 (Round 2: active): Skip mirroring master/layout duplicates
     # ─────────────────────────────────────────────────────────────────────
 
-    def _log_master_layout_duplicates(
+    def _skip_master_layout_duplicates(
         self, slide, shapes: list, slide_number: int,
+        handled_ids: set,
     ) -> None:
-        """Logging-only: detect slide shapes that duplicate master/layout shapes.
-        Does NOT remove or skip anything. Output will be reviewed manually
-        before enabling active dedup in a future round."""
+        """Detect slide-level shapes that duplicate master/layout shapes.
+        Add them to handled_ids so they are SKIPPED during position mirroring.
+        This prevents:
+        - Duplication: slide logo mirrors to opposite side while master logo stays
+        - Occlusion: mirrored slide logo lands on top of master logo
+
+        Matching criteria (3-model consensus):
+        - Same XML element tag (pic, sp, freeform, etc.)
+        - Position within 0.5" tolerance (allows for minor layout adjustments)
+        - Size within 25% ratio tolerance
+        """
         try:
-            TOLERANCE = 45720  # ~0.05"
-            SIZE_PCT = 0.03   # 3% size tolerance
+            TOLERANCE = 457200  # ~0.5" — wider than logging-only to catch more
+            SIZE_RATIO_MIN = 0.75  # 25% size tolerance
+            SIZE_RATIO_MAX = 1.25
 
             # Collect master and layout shape geometries
             layer_shapes = []
@@ -2983,12 +3041,19 @@ class SlideContentTransformer:
                         mh = getattr(ms, 'height', None)
                         if any(v is None for v in (ml, mt, mw, mh)):
                             continue
+                        # Only consider image/picture shapes from master/layout
+                        mtag = ms._element.tag.split('}')[-1]
+                        is_image = (mtag == 'pic'
+                                    or ms._element.find(
+                                        f'.//{{{A_NS}}}blipFill') is not None)
+                        if not is_image:
+                            continue  # Only match image/logo shapes
                         layer_shapes.append({
                             'layer': layer_name,
                             'name': getattr(ms, 'name', '?'),
                             'left': int(ml), 'top': int(mt),
                             'width': int(mw), 'height': int(mh),
-                            'tag': ms._element.tag.split('}')[-1],
+                            'tag': mtag,
                         })
                 except Exception:
                     continue
@@ -3000,36 +3065,47 @@ class SlideContentTransformer:
                 try:
                     if getattr(shape, 'is_placeholder', False):
                         continue
+                    if id(shape) in handled_ids:
+                        continue
                     sl = int(shape.left) if shape.left is not None else None
                     st = int(shape.top) if shape.top is not None else None
                     sw = int(shape.width) if shape.width is not None else None
                     sh = int(shape.height) if shape.height is not None else None
                     if any(v is None for v in (sl, st, sw, sh)):
                         continue
+                    if sw <= 0 or sh <= 0:
+                        continue
+                    # Only match image/logo shapes on the slide
                     stag = shape._element.tag.split('}')[-1]
+                    is_image = (stag == 'pic'
+                                or shape._element.find(
+                                    f'.//{{{A_NS}}}blipFill') is not None)
+                    if not is_image:
+                        continue  # Only skip-mirror image shapes
 
                     for ls in layer_shapes:
-                        if ls['tag'] != stag:
-                            continue
+                        lw = max(1, ls['width'])
+                        lh = max(1, ls['height'])
+                        w_ratio = sw / lw
+                        h_ratio = sh / lh
                         if (abs(sl - ls['left']) < TOLERANCE
                                 and abs(st - ls['top']) < TOLERANCE
-                                and abs(sw - ls['width']) < max(1, ls['width'] * SIZE_PCT)
-                                and abs(sh - ls['height']) < max(1, ls['height'] * SIZE_PCT)):
+                                and SIZE_RATIO_MIN <= w_ratio <= SIZE_RATIO_MAX
+                                and SIZE_RATIO_MIN <= h_ratio <= SIZE_RATIO_MAX):
+                            handled_ids.add(id(shape))
                             logger.info(
-                                'Fix 24 slide %d: shape "%s" (%s) matches '
-                                '%s shape "%s" (pos Δ=%.2f"/%.2f", size Δ=%.1f%%/%.1f%%)',
+                                'Fix 24 slide %d: skip-mirror "%s" — '
+                                'duplicates %s shape "%s"',
                                 slide_number,
-                                getattr(shape, 'name', '?'), stag,
-                                ls['layer'], ls['name'],
-                                abs(sl - ls['left']) / 914400,
-                                abs(st - ls['top']) / 914400,
-                                abs(sw - ls['width']) / max(1, ls['width']) * 100,
-                                abs(sh - ls['height']) / max(1, ls['height']) * 100,
+                                getattr(shape, 'name', '?'),
+                                ls['layer'],
+                                ls['name'],
                             )
+                            break  # One match is enough
                 except Exception:
                     continue
         except Exception as exc:
-            logger.debug('Fix 24 logging: %s', exc)
+            logger.debug('Fix 24: %s', exc)
 
     # ─────────────────────────────────────────────────────────────────────
     # Fix 22: Post-translation Arabic autofit
@@ -3385,6 +3461,103 @@ class SlideContentTransformer:
 
         except Exception as exc:
             logger.debug('_fix_cover_title_anchor: %s', exc)
+
+        return changes
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Fix 25: X-band column coherence for title/secHead layouts
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _force_xband_coherence(
+        self, shapes: list, mirrored_ids: set,
+        panel_handled_ids: set, slide_number: int,
+    ) -> int:
+        """
+        For title/secHead layouts, the per-shape gating (w>20% AND h>30%)
+        can mirror some shapes in a column while leaving shorter ones behind.
+        This creates broken layouts where half a column moves and half stays.
+
+        Fix: Group non-placeholder, non-panel-handled shapes into x-bands
+        (clusters with similar horizontal center). If ANY shape in a band
+        was individually mirrored, force-mirror all un-mirrored shapes in
+        the same band.
+
+        Thresholds (3-model consensus):
+        - X-band tolerance: ±5% of slide width (shapes belong to same column)
+        - Min shape area: 2% of slide area (skip tiny decorative dots)
+        - Skip full-width shapes (>85% slide width)
+        - Skip placeholders and panel-handled shapes
+        """
+        changes = 0
+        try:
+            XBAND_TOL = self._slide_width * 0.05
+            MIN_AREA_RATIO = 0.02
+            slide_area = self._slide_width * self._slide_height
+
+            # Collect eligible shapes with their center-x
+            eligible = []  # (shape, center_x, was_mirrored)
+            for shape in shapes:
+                try:
+                    if getattr(shape, 'is_placeholder', False):
+                        continue
+                    if id(shape) in panel_handled_ids:
+                        continue
+                    l = getattr(shape, 'left', None)
+                    w = getattr(shape, 'width', None)
+                    h = getattr(shape, 'height', None)
+                    if any(v is None for v in (l, w, h)):
+                        continue
+                    l, w, h = int(l), int(w), int(h)
+                    if w >= self._slide_width * 0.85:
+                        continue  # Full-width
+                    if w * h < slide_area * MIN_AREA_RATIO:
+                        continue  # Tiny decoration
+                    center_x = l + w // 2
+                    was_mirrored = id(shape) in mirrored_ids
+                    eligible.append((shape, center_x, was_mirrored))
+                except Exception:
+                    continue
+
+            if not eligible:
+                return 0
+
+            # Cluster into x-bands using simple greedy grouping
+            bands = []  # list of lists of (shape, center_x, was_mirrored)
+            for item in eligible:
+                _, cx, _ = item
+                placed = False
+                for band in bands:
+                    band_avg = sum(c for _, c, _ in band) / len(band)
+                    if abs(cx - band_avg) < XBAND_TOL:
+                        band.append(item)
+                        placed = True
+                        break
+                if not placed:
+                    bands.append([item])
+
+            # For each band: if any shape was mirrored, mirror the rest
+            for band in bands:
+                has_mirrored = any(m for _, _, m in band)
+                if not has_mirrored:
+                    continue  # No mirrored shapes in this band — skip
+                for shape, _, was_mirrored in band:
+                    if was_mirrored:
+                        continue  # Already mirrored
+                    try:
+                        if self._mirror_freeform_shape(shape, self._slide_width):
+                            changes += 1
+                            mirrored_ids.add(id(shape))
+                            logger.debug(
+                                'Fix 25 slide %d: x-band coherence '
+                                'force-mirrored "%s"',
+                                slide_number,
+                                getattr(shape, 'name', '?'),
+                            )
+                    except Exception:
+                        continue
+
+        except Exception as exc:
+            logger.debug('Fix 25: %s', exc)
 
         return changes
 
