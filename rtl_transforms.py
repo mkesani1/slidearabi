@@ -1187,7 +1187,7 @@ class SlideContentTransformer:
             ph_info = get_placeholder_info_from_xml(sp_el)
             if ph_info is None:
                 return False
-            _, ph_idx = ph_info
+            ph_type, ph_idx = ph_info
 
             # Verify layout has a matching placeholder
             layout_ph = None
@@ -1386,6 +1386,46 @@ class SlideContentTransformer:
                                          ph_idx, current_left, new_left)
                     return True
 
+            # ── Symmetric-layout guard for swappable content types ────
+            # In two-column layouts where the layout placeholders are
+            # symmetric (same width, mirrored positions), the Phase 2
+            # swap_positions() call is a no-op — mirror(L1) = L2 and
+            # vice-versa, so the layout positions don't move.  If we
+            # then remove the slide-level xfrm, the shape inherits the
+            # un-swapped layout position → the panels stay on their
+            # original LTR side.
+            #
+            # Fix: for body/object content placeholders, ALWAYS mirror
+            # the slide-level position explicitly.  This handles both
+            # symmetric layouts (where layout swap is a no-op) and
+            # preserves any slide-specific size customizations.
+            # ─────────────────────────────────────────────────────────
+            current_left = shape.left
+            current_width = shape.width
+            current_height = shape.height
+
+            if (ph_type in _SWAPPABLE_CONTENT_TYPES
+                    and current_left is not None
+                    and current_width is not None):
+                slide_w = int(current_width)
+                new_left = self._slide_width - int(current_left) - slide_w
+                new_left = max(0, min(new_left, self._slide_width - slide_w))
+                if abs(new_left - int(current_left)) >= _POSITION_TOLERANCE_EMU:
+                    shape.left = new_left
+                    logger.debug(
+                        'Placeholder %d (%s): swappable-content guard — '
+                        'explicit mirror %d→%d, keeping size %dx%d.',
+                        ph_idx, ph_type,
+                        int(current_left), new_left,
+                        slide_w, int(current_height or 0),
+                    )
+                    return True
+                else:
+                    # Mirror delta is negligible (centered shape) — remove
+                    # xfrm to inherit from layout as normal.
+                    sp_pr.remove(xfrm)
+                    return True
+
             # ── Size-divergence guard ──────────────────────────────────
             # Before removing xfrm (which makes the shape inherit the layout's
             # geometry), check whether the slide-level shape's width/height
@@ -1398,10 +1438,6 @@ class SlideContentTransformer:
             # EITHER direction (larger or smaller), keep explicit geometry.
             # ─────────────────────────────────────────────────────────────
             _SIZE_DIVERGENCE_THRESHOLD = 0.30  # 30% in either direction
-
-            current_left = shape.left
-            current_width = shape.width
-            current_height = shape.height
 
             # ── Fallback: layout has zero/None dimensions ────────────────
             # If we can't read the layout's geometry, it's unsafe to inherit
