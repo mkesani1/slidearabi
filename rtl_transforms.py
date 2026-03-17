@@ -1140,6 +1140,14 @@ class SlideContentTransformer:
         # picture-over-text conflicts. Runs LAST after all position fixes.
         changes += self._fix_placeholder_z_order(slide, slide_number)
 
+        # Fix 25: Resolve text-box / master-logo post-mirror overlap.
+        # After mirroring, a slide-level text box that was on the far left
+        # can land on top of a master-level logo on the right (or vice versa).
+        # Push the text box below the logo to clear the overlap.
+        changes += self._fix_text_master_logo_overlap(
+            slide, all_shapes, slide_number
+        )
+
         # Fix 9: Collision detection (log warnings for overlapping shapes)
         self._detect_collisions(all_shapes, slide_number)
 
@@ -3106,6 +3114,121 @@ class SlideContentTransformer:
                     continue
         except Exception as exc:
             logger.debug('Fix 24: %s', exc)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Fix 25: Post-mirror text-box / master-logo overlap resolution
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _fix_text_master_logo_overlap(
+        self, slide, all_shapes: list, slide_number: int,
+    ) -> int:
+        """Fix 25: After mirroring, a slide-level text box that was originally
+        far from the master logo may have been repositioned into the logo zone.
+        Detect this overlap and push the text box below the logo's bottom edge
+        with a small padding gap.
+        """
+        changes = 0
+        PADDING = 91440  # 0.1" gap below logo
+        try:
+            # 1. Collect master/layout image shapes (logos)
+            logo_rects = []
+            for layer in [slide.slide_layout, slide.slide_layout.slide_master]:
+                try:
+                    for ms in layer.shapes:
+                        ml = getattr(ms, 'left', None)
+                        mt = getattr(ms, 'top', None)
+                        mw = getattr(ms, 'width', None)
+                        mh = getattr(ms, 'height', None)
+                        if any(v is None for v in (ml, mt, mw, mh)):
+                            continue
+                        mtag = ms._element.tag.split('}')[-1]
+                        is_image = (
+                            mtag == 'pic'
+                            or ms._element.find(
+                                f'.//{{{A_NS}}}blipFill') is not None
+                        )
+                        if not is_image:
+                            continue
+                        # Only consider small-ish logos (< 25% of slide width)
+                        slide_width = self._slide_width or 12192000
+                        if int(mw) > slide_width * 0.25:
+                            continue
+                        logo_rects.append({
+                            'left': int(ml), 'top': int(mt),
+                            'width': int(mw), 'height': int(mh),
+                            'name': getattr(ms, 'name', '?'),
+                        })
+                except Exception:
+                    continue
+
+            if not logo_rects:
+                return 0
+
+            # 2. Check each slide-level TEXT BOX for overlap with logos
+            #    Only TextBox (type 17) — skip freeforms, auto-shapes, etc.
+            from pptx.enum.shapes import MSO_SHAPE_TYPE
+            for shape in all_shapes:
+                try:
+                    if not getattr(shape, 'has_text_frame', False):
+                        continue
+                    # Only non-placeholder text boxes (TextBox type)
+                    if getattr(shape, 'is_placeholder', False):
+                        continue
+                    if shape.shape_type != MSO_SHAPE_TYPE.TEXT_BOX:
+                        continue
+                    sx = shape.left
+                    sy = shape.top
+                    sw = shape.width
+                    sh = shape.height
+                    if any(v is None for v in (sx, sy, sw, sh)):
+                        continue
+                    sx, sy, sw, sh = int(sx), int(sy), int(sw), int(sh)
+                    if sw <= 0 or sh <= 0:
+                        continue
+
+                    for logo in logo_rects:
+                        lx = logo['left']
+                        ly = logo['top']
+                        lw = logo['width']
+                        lh = logo['height']
+
+                        # Check horizontal overlap
+                        overlap_x = min(sx + sw, lx + lw) - max(sx, lx)
+                        if overlap_x <= 0:
+                            continue
+                        # Check vertical overlap
+                        overlap_y = min(sy + sh, ly + lh) - max(sy, ly)
+                        if overlap_y <= 0:
+                            continue
+
+                        # There IS overlap — push text box below logo
+                        logo_bottom = ly + lh + PADDING
+                        old_top = sy
+                        xfrm = shape._element.find(
+                            f'.//{{{A_NS}}}xfrm'
+                        )
+                        if xfrm is None:
+                            continue
+                        off = xfrm.find(f'{{{A_NS}}}off')
+                        if off is None:
+                            continue
+                        off.set('y', str(logo_bottom))
+                        shape._element.attrib.pop('dirty', None)
+                        changes += 1
+                        logger.info(
+                            'Fix 25 slide %d: pushed "%s" below '
+                            'master logo "%s" (y %d → %d)',
+                            slide_number,
+                            getattr(shape, 'name', '?'),
+                            logo['name'],
+                            old_top, logo_bottom,
+                        )
+                        break  # Only fix against first overlapping logo
+                except Exception:
+                    continue
+        except Exception as exc:
+            logger.debug('Fix 25: %s', exc)
+        return changes
 
     # ─────────────────────────────────────────────────────────────────────
     # Fix 22: Post-translation Arabic autofit
