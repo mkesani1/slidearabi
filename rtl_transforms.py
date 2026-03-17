@@ -3201,28 +3201,50 @@ class SlideContentTransformer:
                         if overlap_y <= 0:
                             continue
 
-                        # There IS overlap — push text box below logo
-                        logo_bottom = ly + lh + PADDING
-                        old_top = sy
-                        xfrm = shape._element.find(
-                            f'.//{{{A_NS}}}xfrm'
-                        )
-                        if xfrm is None:
-                            continue
-                        off = xfrm.find(f'{{{A_NS}}}off')
-                        if off is None:
-                            continue
-                        off.set('y', str(logo_bottom))
+                        # There IS overlap — shift text box LEFT of the logo
+                        # to preserve its original y position and avoid
+                        # colliding with content below.
+                        new_x = lx - sw - PADDING  # place to left of logo
+                        if new_x < 0:
+                            # Not enough room on the left — fall back to
+                            # pushing below the logo instead.
+                            new_y = ly + lh + PADDING
+                            xfrm = shape._element.find(
+                                f'.//{{{A_NS}}}xfrm'
+                            )
+                            if xfrm is None:
+                                continue
+                            off = xfrm.find(f'{{{A_NS}}}off')
+                            if off is None:
+                                continue
+                            off.set('y', str(new_y))
+                            changes += 1
+                            logger.info(
+                                'Fix 25 slide %d: pushed "%s" below '
+                                'master logo "%s" (y %d → %d)',
+                                slide_number,
+                                getattr(shape, 'name', '?'),
+                                logo['name'], sy, new_y,
+                            )
+                        else:
+                            xfrm = shape._element.find(
+                                f'.//{{{A_NS}}}xfrm'
+                            )
+                            if xfrm is None:
+                                continue
+                            off = xfrm.find(f'{{{A_NS}}}off')
+                            if off is None:
+                                continue
+                            off.set('x', str(new_x))
+                            changes += 1
+                            logger.info(
+                                'Fix 25 slide %d: shifted "%s" left '
+                                'of master logo "%s" (x %d → %d)',
+                                slide_number,
+                                getattr(shape, 'name', '?'),
+                                logo['name'], sx, new_x,
+                            )
                         shape._element.attrib.pop('dirty', None)
-                        changes += 1
-                        logger.info(
-                            'Fix 25 slide %d: pushed "%s" below '
-                            'master logo "%s" (y %d → %d)',
-                            slide_number,
-                            getattr(shape, 'name', '?'),
-                            logo['name'],
-                            old_top, logo_bottom,
-                        )
                         break  # Only fix against first overlapping logo
                 except Exception:
                     continue
