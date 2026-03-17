@@ -97,10 +97,25 @@ _LOGO_MAX_WIDTH_FRACTION = 0.20
 _POSITION_TOLERANCE_EMU = 50_000  # ≈ 0.055 inches
 
 # Placeholder type strings that are "title-like" (keep centered or right-align)
-_TITLE_PH_TYPES = frozenset({'title', 'ctrTitle', 'center_title'})
+# NOTE: get_placeholder_info() now returns normalized names (e.g. 'title' not 'title (1)')
+_TITLE_PH_TYPES = frozenset({
+    'title', 'center_title', 'subtitle', 'vertical_title',
+    'ctrTitle',  # legacy/OOXML alias
+})
 
 # Placeholder type strings that should always be left-aligned (footers, dates)
-_FOOTER_PH_TYPES = frozenset({'ftr', 'sldNum', 'dt', 'footer', 'slideNumber', 'date_time'})
+_FOOTER_PH_TYPES = frozenset({
+    'footer', 'slide_number', 'date', 'date_time', 'header',
+    'ftr', 'sldNum', 'dt', 'slideNumber',  # legacy/OOXML aliases
+})
+
+# Placeholder types eligible for two-column swap (whitelist).
+# Only true content-bearing types participate in column swapping.
+# Everything else (chrome, navigation, metadata) is mirrored individually.
+_SWAPPABLE_CONTENT_TYPES = frozenset({
+    'body', 'object', 'chart', 'table', 'media_clip',
+    'org_chart', 'bitmap', 'picture', 'vertical_body', 'vertical_object',
+})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -629,83 +644,135 @@ class MasterLayoutTransformer:
         Swap the horizontal positions of the two content-area placeholders
         in a two-column layout.
 
-        Identifies the left and right column placeholders by comparing their
-        X positions, then swaps using the mirror formula so each ends up on
-        the opposite side at the correct RTL position.
+        Uses a WHITELIST (_SWAPPABLE_CONTENT_TYPES) to identify which
+        placeholders represent actual content columns.  Only body/object-type
+        placeholders participate in the column swap.  Everything else (title,
+        subtitle, slide_number, footer, date, etc.) is mirrored individually.
 
-        The title placeholder (idx=0) is mirrored separately, not swapped.
+        Uses _set_layout_placeholder_position (Fix 21) for all position writes
+        to preserve full xfrm geometry (x, y, cx, cy).
 
         Returns:
             Count of position changes applied.
         """
         changes = 0
-        content_placeholders = []
-        title_placeholders = []
+        swap_candidates = []      # body/object types → column swap
+        mirror_individually = []  # everything else → simple mirror
 
         for shape in layout.placeholders:
             ph_info = get_placeholder_info(shape)
             if ph_info is None:
                 continue
             ph_type, ph_idx = ph_info
-            if ph_type in _TITLE_PH_TYPES or ph_idx == 0:
-                title_placeholders.append(shape)
+            if ph_type in _SWAPPABLE_CONTENT_TYPES:
+                swap_candidates.append(shape)
             else:
-                content_placeholders.append(shape)
+                mirror_individually.append(shape)
 
-        # Mirror title placeholders individually
-        for shape in title_placeholders:
+        # Mirror non-swappable placeholders (title, subtitle, slide_number,
+        # footer, date, etc.) individually using Fix 21 geometry writes.
+        for shape in mirror_individually:
             try:
                 left, width = shape.left, shape.width
                 if left is None or width is None:
                     continue
                 new_left = mirror_x(left, width, slide_width)
-                if bounds_check_emu(new_left, slide_width) and abs(new_left - left) >= _POSITION_TOLERANCE_EMU:
-                    shape.left = new_left
-                    changes += 1
+                if not bounds_check_emu(new_left, slide_width):
+                    continue
+                if abs(new_left - left) < _POSITION_TOLERANCE_EMU:
+                    continue
+                self._set_layout_placeholder_position(
+                    shape, new_left, shape.top, shape.width, shape.height
+                )
+                changes += 1
             except Exception as exc:
-                logger.debug('title mirror: %s', exc)
+                logger.debug('mirror non-swappable PH: %s', exc)
 
-        # Sort content placeholders left-to-right
-        content_placeholders.sort(key=lambda s: getattr(s, 'left', 0) or 0)
+        # Sort swap candidates left-to-right
+        swap_candidates.sort(key=lambda s: getattr(s, 'left', 0) or 0)
 
-        if len(content_placeholders) >= 2:
-            # Swap the leftmost and rightmost
-            left_ph = content_placeholders[0]
-            right_ph = content_placeholders[-1]
+        if len(swap_candidates) == 2:
+            # Canonical two-column swap
+            left_ph = swap_candidates[0]
+            right_ph = swap_candidates[1]
             try:
                 new_x_left, new_x_right = swap_positions(
                     left_ph.left, left_ph.width,
                     right_ph.left, right_ph.width,
                     slide_width,
                 )
-                left_ph.left = clamp_emu(new_x_left, slide_width)
-                right_ph.left = clamp_emu(new_x_right, slide_width)
+                new_x_left = clamp_emu(new_x_left, slide_width)
+                new_x_right = clamp_emu(new_x_right, slide_width)
+                self._set_layout_placeholder_position(
+                    left_ph, new_x_left, left_ph.top,
+                    left_ph.width, left_ph.height
+                )
+                self._set_layout_placeholder_position(
+                    right_ph, new_x_right, right_ph.top,
+                    right_ph.width, right_ph.height
+                )
                 changes += 2
+                logger.debug(
+                    'Two-column swap: idx=%s (%.2f"→%.2f") ↔ idx=%s (%.2f"→%.2f")',
+                    getattr(left_ph, 'placeholder_format', None)
+                    and left_ph.placeholder_format.idx,
+                    int(left_ph.left) / 914400 if left_ph.left else 0,
+                    new_x_left / 914400,
+                    getattr(right_ph, 'placeholder_format', None)
+                    and right_ph.placeholder_format.idx,
+                    int(right_ph.left) / 914400 if right_ph.left else 0,
+                    new_x_right / 914400,
+                )
             except Exception as exc:
                 logger.warning('_swap_two_column_placeholders: %s', exc)
 
-            # Mirror any remaining content placeholders individually
-            for shape in content_placeholders[1:-1]:
+        elif len(swap_candidates) >= 3:
+            # 3+ content placeholders: swap the two outermost, mirror the rest
+            left_ph = swap_candidates[0]
+            right_ph = swap_candidates[-1]
+            try:
+                new_x_left, new_x_right = swap_positions(
+                    left_ph.left, left_ph.width,
+                    right_ph.left, right_ph.width,
+                    slide_width,
+                )
+                self._set_layout_placeholder_position(
+                    left_ph, clamp_emu(new_x_left, slide_width),
+                    left_ph.top, left_ph.width, left_ph.height
+                )
+                self._set_layout_placeholder_position(
+                    right_ph, clamp_emu(new_x_right, slide_width),
+                    right_ph.top, right_ph.width, right_ph.height
+                )
+                changes += 2
+            except Exception as exc:
+                logger.warning('_swap_two_column_placeholders (3+): %s', exc)
+            # Mirror middle candidates individually
+            for shape in swap_candidates[1:-1]:
                 try:
                     left, width = shape.left, shape.width
                     if left is None or width is None:
                         continue
                     new_left = mirror_x(left, width, slide_width)
                     if bounds_check_emu(new_left, slide_width):
-                        shape.left = new_left
+                        self._set_layout_placeholder_position(
+                            shape, new_left, shape.top, shape.width, shape.height
+                        )
                         changes += 1
                 except Exception as exc:
                     logger.debug('extra content mirror: %s', exc)
 
-        elif len(content_placeholders) == 1:
+        elif len(swap_candidates) == 1:
             # Single content placeholder — just mirror it
-            shape = content_placeholders[0]
+            shape = swap_candidates[0]
             try:
                 left, width = shape.left, shape.width
                 if left is not None and width is not None:
                     new_left = mirror_x(left, width, slide_width)
                     if bounds_check_emu(new_left, slide_width):
-                        shape.left = new_left
+                        self._set_layout_placeholder_position(
+                            shape, new_left, shape.top, shape.width, shape.height
+                        )
                         changes += 1
             except Exception as exc:
                 logger.debug('single content mirror: %s', exc)
