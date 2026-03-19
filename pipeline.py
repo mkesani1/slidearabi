@@ -45,6 +45,16 @@ try:
 except ImportError as e:
     logger.warning(f"RTL transforms not available: {e}")
 
+HAS_RTL_TRANSFORMS_V2 = False
+try:
+    from slidearabi_v2.rtl_transforms_v2 import SlideContentTransformerV2
+    HAS_RTL_TRANSFORMS_V2 = True
+except ImportError as e:
+    logger.warning(f"V2 RTL transforms not available: {e}")
+
+# Engine version: 'v2' (default), 'v1' (fallback), read from env
+ENGINE_VERSION = os.environ.get('SLIDEARABI_ENGINE_VERSION', 'v2')
+
 HAS_TYPOGRAPHY = False
 try:
     from slidearabi.typography import TypographyNormalizer
@@ -421,9 +431,15 @@ class SlideArabiPipeline:
         return layout_report
         
     def _phase_3_transform_slides(self, prs: Presentation, resolved: Any, translations: Dict[str, str]) -> Any:
-        """Phase 3: Transform slide content deterministically."""
+        """Phase 3: Transform slide content deterministically.
+        
+        Uses V2 engine by default (SLIDEARABI_ENGINE_VERSION=v2).
+        Falls back to V1 if V2 unavailable or ENGINE_VERSION=v1.
+        """
         start_time = time.monotonic()
-        logger.info("Phase 3: Transforming slide content...")
+        use_v2 = ENGINE_VERSION == 'v2' and HAS_RTL_TRANSFORMS_V2
+        engine_label = 'v2' if use_v2 else 'v1'
+        logger.info("Phase 3: Transforming slide content [engine=%s]...", engine_label)
         
         if not HAS_RTL_TRANSFORMS:
             logger.warning("Phase 3 skipped: RTL transforms not available")
@@ -448,17 +464,28 @@ class SlideArabiPipeline:
         if HAS_TEMPLATE_REGISTRY:
             registry = TemplateRegistry(prs.slide_width, prs.slide_height)
 
-        transformer = SlideContentTransformer(
-            presentation=prs,
-            template_registry=registry,
-            layout_classifications=layout_classifications,
-            translations=translations,
-        )
+        if use_v2:
+            logger.info("Phase 3: Using V2 classification-first engine")
+            transformer = SlideContentTransformerV2(
+                presentation=prs,
+                template_registry=registry,
+                layout_classifications=layout_classifications,
+                translations=translations,
+            )
+        else:
+            logger.info("Phase 3: Using V1 legacy engine")
+            transformer = SlideContentTransformer(
+                presentation=prs,
+                template_registry=registry,
+                layout_classifications=layout_classifications,
+                translations=translations,
+            )
         report = transformer.transform_all_slides()
         
         duration = (time.monotonic() - start_time) * 1000
         self._log_phase('phase_3_transform_slides', duration, {
             "status": "success",
+            "engine": engine_label,
             "total_changes": report.total_changes,
         })
         return report

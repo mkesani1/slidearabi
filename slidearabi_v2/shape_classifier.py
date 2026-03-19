@@ -46,6 +46,22 @@ _BG_FULL_COVER_FRACTION = 0.95  # width AND height >= 95% → definite backgroun
 _PANEL_MIN_WIDTH_FRACTION = 0.35   # anchor must be >= 35% slide width
 _PANEL_MIN_HEIGHT_FRACTION = 0.50  # anchor must be >= 50% slide height
 _FULL_WIDTH_FRACTION = 0.85        # shapes this wide span both panels
+_CENTERLINE_EXCLUSION_FRACTION = 0.05  # shapes within 5% of midpoint → not panel-assigned
+
+# Asymmetric panel detection (one image anchor + text cluster on opposite side)
+_ASYM_PANEL_MIN_WIDTH = 0.30       # relaxed anchor width for asymmetric detection
+_ASYM_PANEL_IMAGE_AREA = 0.20      # image area >= 20% of slide → panel image
+_ASYM_PANEL_IMAGE_WIDTH = 0.40     # image width >= 40% of slide → panel image (landscape)
+
+# Strategy 2b: Dominant image + single text shape on opposite side
+_DOMINANT_IMAGE_MIN_WIDTH = 0.40     # image must be >= 40% slide width
+_DOMINANT_IMAGE_MIN_HEIGHT = 0.80    # image must be >= 80% slide height
+_OPPOSITE_TEXT_MIN_WIDTH = 0.25      # text shape must be >= 25% slide width
+
+# Cluster-based panel detection (no single anchor, but clear spatial grouping)
+_CLUSTER_MIN_WIDTH_FRACTION = 0.25   # cluster bbox width >= 25% of slide
+_CLUSTER_MIN_HEIGHT_FRACTION = 0.30  # cluster bbox height >= 30% of slide
+_CLUSTER_MIN_GAP_FRACTION = 0.05     # horizontal gap >= 5% of slide between clusters
 
 # Logo detection
 _LOGO_MAX_WIDTH_FRACTION = 0.20    # image < 20% slide width = logo
@@ -55,9 +71,10 @@ _BLEED_THRESHOLD_EMU = 100_000     # ~0.11" — minimum bleed to classify as BLE
 _MAX_BLEED_EMU = 1_500_000         # ~1.64" — maximum allowed intentional bleed
 
 # Overlay/map detection
-_MAP_AREA_FRACTION = 0.40          # base image must cover >= 40% of slide area
-_MAP_WIDTH_FRACTION = 0.60         # base image must be >= 60% of slide width
+_MAP_AREA_FRACTION = 0.35          # base image must cover >= 35% of slide area
+_MAP_WIDTH_FRACTION = 0.55         # base image must be >= 55% of slide width
 _OVERLAY_MAX_WIDTH_FRACTION = 0.30 # overlay shapes must be < 30% slide width
+_OVERLAY_MAX_WIDTH_GROUP = 0.40    # GROUP shapes allowed up to 40% (larger bboxes)
 _OVERLAY_MIN_COUNT = 3             # need >= 3 small shapes to qualify as overlay
 
 # Decorative (title/secHead layouts)
@@ -193,6 +210,7 @@ class SplitPanelInfo:
     left_bbox: Tuple[int, int]           # (min_x, max_x) of left panel
     right_bbox: Tuple[int, int]          # (min_x, max_x) of right panel
     shift_delta: int                     # EMU to shift for panel swap
+    dominant_image: bool = False          # True if detected via Strategy 2b (single text + dominant image)
 
 
 @dataclass
@@ -412,33 +430,60 @@ class ShapeClassifier:
         classifications: Dict[int, ShapeClassification] = {}
         classified_ids: Set[int] = set()
 
-        # 3a. Classify panel shapes (from pre-scan) first
-        if context.split_panel is not None:
-            for sid in context.split_panel.left_shape_ids:
-                if sid not in classified_ids:
-                    classifications[sid] = _make_classification(
-                        ShapeRole.PANEL_LEFT,
-                        rule_name='split_panel_left',
-                        panel_side='left',
-                        panel_shift_delta=context.split_panel.shift_delta,
-                    )
-                    classified_ids.add(sid)
-            for sid in context.split_panel.right_shape_ids:
-                if sid not in classified_ids:
-                    classifications[sid] = _make_classification(
-                        ShapeRole.PANEL_RIGHT,
-                        rule_name='split_panel_right',
-                        panel_side='right',
-                        panel_shift_delta=context.split_panel.shift_delta,
-                    )
-                    classified_ids.add(sid)
-
-        # 3b. Classify overlay shapes (from pre-scan)
+        # 3a. Classify overlay shapes FIRST (geographically anchored —
+        #     must not be re-assigned as panel shapes)
         for sid in context.overlay_shape_ids:
             if sid not in classified_ids:
                 classifications[sid] = _make_classification(
                     ShapeRole.OVERLAY,
-                    rule_name='map_overlay',
+                    rule_name='overlay_prescan',
+                )
+                classified_ids.add(sid)
+
+        # 3b. Classify panel shapes (from pre-scan)
+        # Footer/title placeholders must NOT become panel shapes — they are
+        # structural elements that stay in their original positions.
+        _NON_PANEL_PH_KEYWORDS = frozenset({
+            'ftr', 'sldnum', 'dt', 'footer', 'slidenumber', 'date_time',
+            'title', 'ctrtitle',
+        })
+
+        def _is_non_panel_placeholder(shape_id: int) -> bool:
+            """Check if shape is a footer/title placeholder that must not become a panel."""
+            sd = _sd_by_id.get(shape_id)
+            if sd is None or not sd.is_placeholder:
+                return False
+            ph_type = (sd.placeholder_type or '').lower()
+            return any(k in ph_type for k in _NON_PANEL_PH_KEYWORDS)
+
+        _sd_by_id = {sd.shape_id: sd for sd in shape_data_list}
+
+        if context.split_panel is not None:
+            # For dominant-image panels (Strategy 2b), the single text shape
+            # IS the panel content — don't exclude it even if it's a title placeholder.
+            skip_ph_exclusion = getattr(context.split_panel, 'dominant_image', False)
+            for sid in context.split_panel.left_shape_ids:
+                if sid in classified_ids:
+                    continue
+                if not skip_ph_exclusion and _is_non_panel_placeholder(sid):
+                    continue
+                classifications[sid] = _make_classification(
+                    ShapeRole.PANEL_LEFT,
+                    rule_name='split_panel_left',
+                    panel_side='left',
+                    panel_shift_delta=context.split_panel.shift_delta,
+                )
+                classified_ids.add(sid)
+            for sid in context.split_panel.right_shape_ids:
+                if sid in classified_ids:
+                    continue
+                if not skip_ph_exclusion and _is_non_panel_placeholder(sid):
+                    continue
+                classifications[sid] = _make_classification(
+                    ShapeRole.PANEL_RIGHT,
+                    rule_name='split_panel_right',
+                    panel_side='right',
+                    panel_shift_delta=context.split_panel.shift_delta,
                 )
                 classified_ids.add(sid)
 
@@ -447,6 +492,25 @@ class ShapeClassifier:
             if sd.shape_id in classified_ids:
                 continue
             cls = self._classify_single_shape(sd, context)
+
+            # MAP_OVERLAY slide-level override: translate text ONLY.
+            # Geographic annotations must not move, flip, or change direction.
+            # Only structural placeholders (title/footer) get normal treatment.
+            if (context.slide_role == SlideRole.MAP_OVERLAY
+                    and cls.role not in (
+                        ShapeRole.PLACEHOLDER, ShapeRole.FOOTER,
+                    )):
+                cls = ShapeClassification(
+                    role=cls.role,
+                    position_action='keep',        # Don't move
+                    text_action=cls.text_action,   # Still translate
+                    direction_action='none',        # Don't flip/rotate
+                    rule_name=cls.rule_name + '_map_translate_only',
+                    confidence=cls.confidence,
+                    placeholder_type=cls.placeholder_type,
+                    placeholder_idx=cls.placeholder_idx,
+                )
+
             classifications[sd.shape_id] = cls
             classified_ids.add(sd.shape_id)
 
@@ -602,7 +666,12 @@ class ShapeClassifier:
         # Detect map overlay (large image + small overlay shapes)
         map_bg_id, overlay_ids = self._detect_map_overlay(shapes, background_ids)
         ctx.map_background_id = map_bg_id
-        ctx.overlay_shape_ids = frozenset(overlay_ids)
+
+        # Detect pie/donut label overlays (text shapes over pie/donut charts)
+        pie_label_ids = self._detect_pie_donut_labels(shapes, background_ids)
+
+        # Merge both overlay sets
+        ctx.overlay_shape_ids = frozenset(overlay_ids | pie_label_ids)
 
         # Detect split-panel layout (two large shapes on opposite halves)
         # Skip if map overlay was detected (map slides are not split-panel)
@@ -742,12 +811,13 @@ class ShapeClassifier:
         Returns (map_bg_shape_id, overlay_shape_ids)
         """
         # Find candidate base image
+        # NOTE: Do NOT skip background_ids — map images often cover >90% width
+        # and get classified as backgrounds. They can still be the map base.
         base_image: Optional[_ShapeData] = None
         best_area = 0
 
         for sd in shapes:
-            if sd.shape_id in background_ids:
-                continue
+            # Allow background-classified images as map base
             if not (sd.is_picture or sd.has_blip_fill):
                 continue
             if sd.area < self.slide_area * _MAP_AREA_FRACTION:
@@ -761,7 +831,9 @@ class ShapeClassifier:
         if base_image is None:
             return None, set()
 
-        # Find small shapes inside the base image
+        # Find small shapes inside the base image (with vertical extension
+        # for icon/label rows placed just below the map image)
+        bottom_extension = int(self.slide_height * 0.10)
         candidates: List[int] = []
         for sd in shapes:
             if sd.shape_id == base_image.shape_id:
@@ -770,17 +842,118 @@ class ShapeClassifier:
                 continue
             if sd.is_placeholder:
                 continue
-            if sd.width >= self.slide_width * _OVERLAY_MAX_WIDTH_FRACTION:
+            # GROUP shapes get a wider threshold (their bboxes are larger)
+            max_w = _OVERLAY_MAX_WIDTH_GROUP if sd.is_group else _OVERLAY_MAX_WIDTH_FRACTION
+            if sd.width >= self.slide_width * max_w:
                 continue
             # Center must be inside base image bounding box
+            # (with 10% vertical extension below for legend rows)
             if (base_image.left <= sd.center_x <= base_image.right
-                    and base_image.top <= sd.center_y <= base_image.bottom):
+                    and base_image.top <= sd.center_y <= base_image.bottom + bottom_extension):
                 candidates.append(sd.shape_id)
 
         if len(candidates) >= _OVERLAY_MIN_COUNT:
             return base_image.shape_id, set(candidates)
 
+        # Fallback: for wide images (aspect ratio >= 1.5, likely maps),
+        # accept with 2 candidates instead of 3
+        if base_image.height > 0:
+            aspect = base_image.width / base_image.height
+            if aspect >= 1.5 and len(candidates) >= 2:
+                return base_image.shape_id, set(candidates)
+
         return None, set()
+
+    # Pie/donut chart types (no axis, rotationally symmetric)
+    _PIE_DONUT_TYPES = frozenset({
+        'pieChart', 'pie3DChart', 'doughnutChart', 'ofPieChart',
+    })
+
+    # Axis-based chart types (used to exclude combo charts)
+    _AXIS_CHART_TYPES = frozenset({
+        'barChart', 'bar3DChart', 'lineChart', 'line3DChart',
+        'areaChart', 'area3DChart', 'scatterChart', 'radarChart',
+        'stockChart', 'surfaceChart', 'surface3DChart', 'bubbleChart',
+    })
+
+    def _detect_pie_donut_labels(
+        self,
+        shapes: List[_ShapeData],
+        background_ids: Set[int],
+    ) -> Set[int]:
+        """
+        Detect text shapes overlaid on pie/donut charts.
+
+        Pie/donut charts are rotationally symmetric — their graphic stays
+        unchanged during RTL transform.  External text labels (%, category)
+        that are positioned over the chart must NOT be position-mirrored,
+        or they will point to the wrong segments.
+
+        Returns set of shape_ids for text shapes that are label overlays.
+        """
+        c_ns = 'http://schemas.openxmlformats.org/drawingml/2006/chart'
+
+        # Find pie/donut-only chart shapes and their bounding boxes
+        pie_chart_rects: List[Tuple[int, int, int, int]] = []  # (left, top, right, bottom)
+        for sd in shapes:
+            if not (getattr(sd.shape, 'has_chart', False) and sd.shape.has_chart):
+                continue
+            try:
+                chart_elem = sd.shape.chart._part._element
+                has_pie = any(
+                    chart_elem.find(f'.//{{{c_ns}}}{t}') is not None
+                    for t in self._PIE_DONUT_TYPES
+                )
+                has_axis = any(
+                    chart_elem.find(f'.//{{{c_ns}}}{t}') is not None
+                    for t in self._AXIS_CHART_TYPES
+                )
+                if has_pie and not has_axis:
+                    pie_chart_rects.append((sd.left, sd.top, sd.right, sd.bottom))
+            except Exception:
+                continue
+
+        if not pie_chart_rects:
+            return set()
+
+        # Find text/small shapes whose center falls inside any pie/donut chart
+        # (with expanded bounding box to catch callout-style external labels).
+        # Pie/donut labels often sit WELL outside the chart frame with
+        # connector lines pointing inward — 5% margin is not enough.
+        # Use 25% horizontal margin to catch these (Round 11 fix).
+        _structural_ph_types = frozenset({
+            'ftr', 'sldnum', 'dt', 'footer', 'slidenumber',
+            'date_time', 'title', 'ctrtitle',
+        })
+        label_ids: Set[int] = set()
+        margin_x = int(self.slide_width * 0.25)
+        margin_y = int(self.slide_height * 0.15)
+        for sd in shapes:
+            if sd.shape_id in background_ids:
+                continue
+            # Skip structural placeholders (footer/title)
+            if sd.is_placeholder:
+                ph_type = (sd.placeholder_type or '').lower()
+                if any(t in ph_type for t in _structural_ph_types):
+                    continue
+            # Include text shapes AND small non-text shapes (callouts)
+            if not sd.has_text and sd.width > self.slide_width * 0.15:
+                continue
+            # Skip wide shapes (titles, subtitles) — pie labels are small
+            if sd.width > self.slide_width * 0.20:
+                continue
+            for (c_left, c_top, c_right, c_bottom) in pie_chart_rects:
+                if (c_left - margin_x <= sd.center_x <= c_right + margin_x
+                        and c_top - margin_y <= sd.center_y <= c_bottom + margin_y):
+                    label_ids.add(sd.shape_id)
+                    break
+
+        if label_ids:
+            logger.debug(
+                'Pie/donut overlay detection: found %d label shapes over %d pie charts',
+                len(label_ids), len(pie_chart_rects),
+            )
+        return label_ids
 
     def _detect_split_panel(
         self,
@@ -790,29 +963,72 @@ class ShapeClassifier:
         """
         Detect split-panel layout (image on one side, content on other).
 
-        Algorithm:
-        1. Find anchor shapes: width >= 35% AND height >= 50%
-        2. Pick best left anchor (center_x < midpoint) and right anchor
-        3. Verify asymmetry: one is image, the other is not
-           - ALSO allow same-type pairs (two groups) per Gemini rule
-        4. Classify all non-bg, non-full-width shapes into panels by center_x
+        Detection strategy (cascading, ported from v1):
+        1. Anchor-based: large shape (>=35% W, >=50% H) on each side,
+           with image/non-image asymmetry.
+        2. Asymmetric: ONE side has a large image anchor, the other has
+           >=2 non-image shapes (no anchor needed on text side).
+        2b. Dominant image: ONE side has a near-full-height image
+            (>=40% W, >=80% H), the other has exactly 1 non-image shape
+            (>=25% W). Handles slides with a single text block opposite
+            a dominant photo (e.g., Lukas S1).
+        3. Cluster-based: shapes form two spatially distinct groups on
+           opposite sides with a clear gap and image asymmetry.
 
         Returns SplitPanelInfo or None.
         """
-        # Step 1: Find anchor candidates (large shapes, excluding backgrounds)
+        # ── Partition shapes into left/right by center_x ──────────────
+        left_shapes: List[_ShapeData] = []
+        right_shapes: List[_ShapeData] = []
+
+        for sd in shapes:
+            if sd.shape_id in background_ids:
+                continue
+            if sd.width >= self.slide_width * _FULL_WIDTH_FRACTION:
+                continue
+
+            visible_left = max(0, sd.left)
+            visible_right = min(self.slide_width, sd.right)
+            visible_center_x = (visible_left + visible_right) // 2
+
+            if visible_center_x < self.half_width:
+                left_shapes.append(sd)
+            else:
+                right_shapes.append(sd)
+
+        if not left_shapes or not right_shapes:
+            return None
+
+        def _is_image(sd: _ShapeData) -> bool:
+            return sd.is_picture or sd.has_blip_fill
+
+        def _is_panel_image(sd: _ShapeData) -> bool:
+            """Size-weighted: only large images qualify as panel anchors."""
+            if not _is_image(sd):
+                return False
+            if self.slide_width == 0 or self.slide_height == 0:
+                return False
+            wr = sd.width / self.slide_width
+            hr = sd.height / self.slide_height
+            ar = sd.area / self.slide_area if self.slide_area > 0 else 0
+            return (
+                (wr > 0.25 and hr > 0.50)
+                or ar > _ASYM_PANEL_IMAGE_AREA
+                or wr > _ASYM_PANEL_IMAGE_WIDTH
+            )
+
+        # ── Find anchor candidates (large shapes) ────────────────────
         left_anchor: Optional[_ShapeData] = None
         right_anchor: Optional[_ShapeData] = None
 
         for sd in shapes:
             if sd.shape_id in background_ids:
                 continue
-            # Include placeholders in anchor detection (v2 fix for v1 bug)
             if sd.width < self.slide_width * _PANEL_MIN_WIDTH_FRACTION:
                 continue
             if sd.height < self.slide_height * _PANEL_MIN_HEIGHT_FRACTION:
                 continue
 
-            # Use visible center for shapes with negative positions (bleed fix)
             visible_left = max(0, sd.left)
             visible_right = min(self.slide_width, sd.right)
             visible_center_x = (visible_left + visible_right) // 2
@@ -824,37 +1040,180 @@ class ShapeClassifier:
                 if right_anchor is None or sd.width > right_anchor.width:
                     right_anchor = sd
 
-        # Need anchors on both sides
-        if left_anchor is None or right_anchor is None:
+        # ── Strategy 1: Anchor-based (both sides have large shapes) ───
+        anchor_detected = False
+        if left_anchor is not None and right_anchor is not None:
+            left_is_img = _is_image(left_anchor)
+            right_is_img = _is_image(right_anchor)
+            if left_is_img != right_is_img:
+                anchor_detected = True
+            elif not left_is_img and not right_is_img:
+                # Both non-images OK (e.g., two groups in Lukas slide 8)
+                anchor_detected = True
+            elif left_is_img and right_is_img:
+                # Both images — only if clearly different sizes
+                if abs(left_anchor.area - right_anchor.area) >= self.slide_area * 0.10:
+                    anchor_detected = True
+
+        # ── Strategy 2: Asymmetric (one image anchor + text cluster) ──
+        asymmetric_detected = False
+        if not anchor_detected:
+            # Exactly one anchor exists and it is an image
+            if (left_anchor is not None) != (right_anchor is not None):
+                anchor = left_anchor if left_anchor is not None else right_anchor
+                if _is_image(anchor):
+                    if anchor is left_anchor:
+                        other_side = right_shapes
+                        other_has_panel_img = any(
+                            _is_panel_image(s) for s in right_shapes
+                        )
+                    else:
+                        other_side = left_shapes
+                        other_has_panel_img = any(
+                            _is_panel_image(s) for s in left_shapes
+                        )
+                    if len(other_side) >= 2 and not other_has_panel_img:
+                        asymmetric_detected = True
+                        logger.debug(
+                            'Split panel: asymmetric — image anchor on %s, '
+                            '%d shapes on %s',
+                            'left' if anchor is left_anchor else 'right',
+                            len(other_side),
+                            'right' if anchor is left_anchor else 'left',
+                        )
+            # Also try: no anchors at all, but one side has a panel-sized
+            # image (>40% width or >20% area) and the other doesn't
+            if not asymmetric_detected and left_anchor is None and right_anchor is None:
+                left_has_panel = any(_is_panel_image(s) for s in left_shapes)
+                right_has_panel = any(_is_panel_image(s) for s in right_shapes)
+                if left_has_panel != right_has_panel:
+                    img_side = left_shapes if left_has_panel else right_shapes
+                    txt_side = right_shapes if left_has_panel else left_shapes
+                    if len(txt_side) >= 2:
+                        asymmetric_detected = True
+                        logger.debug(
+                            'Split panel: asymmetric (no anchors) — '
+                            'panel image on %s, %d shapes on %s',
+                            'left' if left_has_panel else 'right',
+                            len(txt_side),
+                            'right' if left_has_panel else 'left',
+                        )
+
+        # ── Strategy 2b: Dominant image + single text on opposite side ─
+        # Handles slides like Lukas S1: one large photo (>=40% W, >=80% H)
+        # on one side, exactly 1 non-image text shape (>=25% W) on the other.
+        # Strategy 2 requires >=2 shapes on the text side; this relaxes to 1
+        # when the image is clearly dominant (near full-height).
+        dominant_detected = False
+        if not anchor_detected and not asymmetric_detected:
+            if (left_anchor is not None) != (right_anchor is not None):
+                anchor = left_anchor if left_anchor is not None else right_anchor
+                if _is_image(anchor):
+                    wr = anchor.width / self.slide_width if self.slide_width else 0
+                    hr = anchor.height / self.slide_height if self.slide_height else 0
+                    if wr >= _DOMINANT_IMAGE_MIN_WIDTH and hr >= _DOMINANT_IMAGE_MIN_HEIGHT:
+                        other_side = (
+                            right_shapes if anchor is left_anchor else left_shapes
+                        )
+                        # Exactly 1 non-image shape, wide enough to be content
+                        non_img = [
+                            s for s in other_side if not _is_image(s)
+                        ]
+                        if (len(non_img) == 1
+                                and non_img[0].width
+                                >= self.slide_width * _OPPOSITE_TEXT_MIN_WIDTH):
+                            dominant_detected = True
+                            logger.debug(
+                                'Split panel: dominant image (%.0f%%W × %.0f%%H) '
+                                'on %s, 1 text shape on %s',
+                                wr * 100, hr * 100,
+                                'left' if anchor is left_anchor else 'right',
+                                'right' if anchor is left_anchor else 'left',
+                            )
+
+        # ── Strategy 3: Cluster-based fallback ────────────────────────
+        cluster_detected = False
+        if not anchor_detected and not asymmetric_detected and not dominant_detected:
+            def _cluster_bbox(
+                shape_list: List[_ShapeData],
+            ) -> Tuple[int, int, int, int]:
+                if not shape_list:
+                    return 0, 0, 0, 0
+                min_x = min(s.left for s in shape_list)
+                max_x = max(s.right for s in shape_list)
+                min_y = min(s.top for s in shape_list)
+                max_y = max(s.bottom for s in shape_list)
+                return min_x, max_x, min_y, max_y
+
+            l_x1, l_x2, l_y1, l_y2 = _cluster_bbox(left_shapes)
+            r_x1, r_x2, r_y1, r_y2 = _cluster_bbox(right_shapes)
+
+            l_w = l_x2 - l_x1
+            l_h = l_y2 - l_y1
+            r_w = r_x2 - r_x1
+            r_h = r_y2 - r_y1
+
+            min_w = self.slide_width * _CLUSTER_MIN_WIDTH_FRACTION
+            min_h = self.slide_height * _CLUSTER_MIN_HEIGHT_FRACTION
+
+            left_qualifies = l_w >= min_w and l_h >= min_h
+            right_qualifies = r_w >= min_w and r_h >= min_h
+
+            gap = r_x1 - l_x2
+            min_gap = self.slide_width * _CLUSTER_MIN_GAP_FRACTION
+
+            if ((left_qualifies or right_qualifies)
+                    and gap >= min_gap
+                    and (len(left_shapes) >= 2 or len(right_shapes) >= 2)):
+                left_has_panel = any(_is_panel_image(s) for s in left_shapes)
+                right_has_panel = any(_is_panel_image(s) for s in right_shapes)
+                if left_has_panel != right_has_panel:
+                    cluster_detected = True
+
+        if not (anchor_detected or asymmetric_detected
+                or dominant_detected or cluster_detected):
             return None
 
-        # Step 2: Verify asymmetry (image vs non-image)
-        # Allow both: (image vs non-image) AND (same-type like two groups)
-        left_is_img = left_anchor.is_picture or left_anchor.has_blip_fill
-        right_is_img = right_anchor.is_picture or right_anchor.has_blip_fill
+        # ── Classify shapes into left/right panels ────────────────────
+        # For anchor-based, use the found anchors.
+        # For asymmetric/cluster, synthesize anchor IDs from the largest
+        # shape on each side.
+        if not anchor_detected:
+            # Pick the largest shape on each side as synthetic anchor
+            left_anchor = max(left_shapes, key=lambda s: s.area)
+            right_anchor = max(right_shapes, key=lambda s: s.area)
 
-        # Both images with no other distinguishing features → not a panel
-        # Both non-images are OK (e.g., two groups in Lukas slide 8)
-        if left_is_img and right_is_img:
-            # Both are images — only proceed if they're clearly different
-            # (one much larger than other, or different shape types)
-            if abs(left_anchor.area - right_anchor.area) < self.slide_area * 0.10:
-                return None  # Similar-sized images — not a split panel
-
-        # Step 3: Classify all shapes into left/right panels
         left_ids: Set[int] = set()
         right_ids: Set[int] = set()
+        centerline_margin = int(
+            self.slide_width * _CENTERLINE_EXCLUSION_FRACTION,
+        )
 
         for sd in shapes:
             if sd.shape_id in background_ids:
                 continue
-            # Skip full-width shapes (backgrounds/separators)
             if sd.width >= self.slide_width * _FULL_WIDTH_FRACTION:
                 continue
 
             visible_left = max(0, sd.left)
             visible_right = min(self.slide_width, sd.right)
             visible_center_x = (visible_left + visible_right) // 2
+
+            # Anchors always assigned to their panel
+            if sd.shape_id == left_anchor.shape_id:
+                left_ids.add(sd.shape_id)
+                continue
+            if sd.shape_id == right_anchor.shape_id:
+                right_ids.add(sd.shape_id)
+                continue
+
+            # Exclude small shapes near the center line — classify individually.
+            # Large shapes (>30% width) or placeholders that straddle the center
+            # are content elements that belong to a panel — assign by center_x.
+            distance_from_midpoint = abs(visible_center_x - self.half_width)
+            is_large = sd.width >= self.slide_width * 0.30
+            if distance_from_midpoint < centerline_margin and not is_large:
+                continue
 
             if visible_center_x < self.half_width:
                 left_ids.add(sd.shape_id)
@@ -864,7 +1223,7 @@ class ShapeClassifier:
         if not left_ids or not right_ids:
             return None
 
-        # Step 4: Compute panel bounding boxes and shift delta
+        # ── Compute panel bounding boxes and shift delta ──────────────
         left_min_x = min(
             sd.left for sd in shapes if sd.shape_id in left_ids
         )
@@ -888,6 +1247,7 @@ class ShapeClassifier:
             left_bbox=(left_min_x, left_max_x),
             right_bbox=(right_min_x, right_max_x),
             shift_delta=shift_delta,
+            dominant_image=dominant_detected,
         )
 
     # ───────────────────────────────────────────────────────────────────
