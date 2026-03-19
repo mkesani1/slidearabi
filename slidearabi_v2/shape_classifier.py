@@ -142,6 +142,7 @@ class ShapeRole(Enum):
     PANEL_LEFT       = auto()  # Left half of split-panel layout
     PANEL_RIGHT      = auto()  # Right half of split-panel layout
     DECORATIVE       = auto()  # Accent bars, gradient panels, brand elements
+    COMPLEX_GRAPHIC  = auto()  # Multi-child infographic — translate only, preserve position
     GROUP            = auto()  # Group shape containing mixed content
     CONTENT_IMAGE    = auto()  # Photo, illustration, screenshot (non-bg)
     CONTENT_TEXT     = auto()  # Freeform text box with content
@@ -184,6 +185,7 @@ _ROLE_ACTIONS: Dict[ShapeRole, Dict[str, str]] = {
     ShapeRole.CONTENT_TEXT:  {'position': 'mirror',     'text': 'translate_rtl',  'direction': 'remove_flip'},
     ShapeRole.TABLE:         {'position': 'mirror',     'text': 'translate_rtl',  'direction': 'none'},
     ShapeRole.CHART:         {'position': 'mirror',     'text': 'translate_rtl',  'direction': 'none'},
+    ShapeRole.COMPLEX_GRAPHIC: {'position': 'keep',      'text': 'translate_rtl',  'direction': 'none'},
     ShapeRole.GROUP:         {'position': 'mirror',     'text': 'translate_rtl',  'direction': 'remove_flip'},
     ShapeRole.DECORATIVE:    {'position': 'keep',       'text': 'rtl_only',       'direction': 'remove_flip'},
     ShapeRole.LOGO:          {'position': 'mirror',     'text': 'none',           'direction': 'none'},
@@ -1315,7 +1317,9 @@ class ShapeClassifier:
 
         # ── Priority 6: BACKGROUND ──
         # Full-width (>= 90%) OR full coverage (>= 95% both dims)
-        if sd.width >= self.slide_width * _BG_WIDTH_FRACTION:
+        # FIX: text-bearing wide shapes must NOT be classified as BACKGROUND
+        # (was silently suppressing translation on full-width text banners)
+        if sd.width >= self.slide_width * _BG_WIDTH_FRACTION and not sd.has_text:
             return _make_classification(
                 ShapeRole.BACKGROUND,
                 rule_name='bg_full_width',
@@ -1384,9 +1388,11 @@ class ShapeClassifier:
         # ── Priority 11: DECORATIVE (layout-dependent) ──
         if ctx.layout_type in _CENTERED_LAYOUTS:
             # On title/secHead layouts, small shapes are decorative
+            # FIX: text-bearing shapes must NOT be classified as DECORATIVE
+            # (was silently suppressing translation on column headers, labels, etc.)
             if (sd.width < self.slide_width * _DECORATIVE_MAX_WIDTH_FRACTION
                     or sd.height < self.slide_height * _DECORATIVE_MAX_HEIGHT_FRACTION):
-                if not sd.has_blip_fill and not sd.is_picture:
+                if not sd.has_blip_fill and not sd.is_picture and not sd.has_text:
                     return _make_classification(
                         ShapeRole.DECORATIVE,
                         rule_name='decorative_title_layout_small',
@@ -1396,13 +1402,40 @@ class ShapeClassifier:
                 sd.width > self.slide_width * _CONTENT_MIN_WIDTH_FRACTION
                 and sd.height > self.slide_height * _CONTENT_MIN_HEIGHT_FRACTION
             )
-            if not is_content_sized and not sd.has_blip_fill and not sd.is_picture:
-                # Small non-image shape on title layout → decorative
+            if not is_content_sized and not sd.has_blip_fill and not sd.is_picture and not sd.has_text:
+                # Small non-image, non-text shape on title layout → decorative
                 return _make_classification(
                     ShapeRole.DECORATIVE,
                     rule_name='decorative_title_layout_noncontent',
                     confidence=0.7,
                 )
+
+        # ── Priority 11.5: COMPLEX_GRAPHIC ──
+        # Groups with many children or mixed content represent infographics
+        # (SWOT, timelines, org charts, process flows) that must NOT be mirrored.
+        # User hard rule: "complex shapes and graphics should only be translated not mirrored"
+        if sd.is_group:
+            try:
+                children = list(sd.shape.shapes)
+                child_count = len(children)
+                text_children = sum(1 for c in children if getattr(c, 'has_text_frame', False))
+                non_text_children = child_count - text_children
+
+                # Condition 1: Many children (almost certainly an infographic)
+                # Condition 2: Large group with mixed content (text + non-text)
+                has_mixed = text_children >= 2 and non_text_children >= 2
+                is_large = (
+                    sd.width > self.slide_width * 0.35
+                    or sd.height > self.slide_height * 0.35
+                )
+
+                if child_count >= 6 or (has_mixed and is_large and child_count >= 4):
+                    return _make_classification(
+                        ShapeRole.COMPLEX_GRAPHIC,
+                        rule_name=f'complex_graphic_{child_count}children',
+                    )
+            except Exception:
+                pass
 
         # ── Priority 12: GROUP ──
         if sd.is_group:

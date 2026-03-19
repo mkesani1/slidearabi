@@ -162,11 +162,21 @@ class SlideContentTransformerV2:
             self._v1_dispatcher = V1CompatDispatcher(v1_transformer)
 
         # Pre-build lowercase translation index for O(1) case-insensitive lookups
+        # Fix: keep longer Arabic value on duplicate keys (was: first-writer-wins)
         self._translations_lower: Dict[str, str] = {}
         for key, val in self.translations.items():
             lower_key = key.strip().lower()
-            if lower_key not in self._translations_lower:
+            existing = self._translations_lower.get(lower_key)
+            if existing is None or len(val) > len(existing):
                 self._translations_lower[lower_key] = val
+
+        # Normalized whitespace index — collapses internal whitespace for robust matching
+        self._translations_normalized: Dict[str, str] = {}
+        for key, val in self.translations.items():
+            norm_key = ' '.join(key.split()).strip().lower()
+            existing = self._translations_normalized.get(norm_key)
+            if existing is None or len(val) > len(existing):
+                self._translations_normalized[norm_key] = val
 
         # Handler dispatch table: position_action → handler method
         self._position_handlers = {
@@ -289,6 +299,8 @@ class SlideContentTransformerV2:
                     # Handle group children text
                     if cls.role == ShapeRole.GROUP:
                         changes += self._process_group_children(shape, cls)
+                    elif cls.role == ShapeRole.COMPLEX_GRAPHIC:
+                        changes += self._process_complex_graphic_children(shape, cls)
                     if cls.role == ShapeRole.TABLE:
                         changes += self._handle_table(shape)
                     continue
@@ -309,6 +321,10 @@ class SlideContentTransformerV2:
                     changes += self._handle_chart(shape)
                 elif cls.role == ShapeRole.GROUP:
                     changes += self._process_group_children(shape, cls)
+                elif cls.role == ShapeRole.COMPLEX_GRAPHIC:
+                    # P1-2: Complex graphics — translate children text ONLY.
+                    # No direction reversal on children (preserve infographic layout).
+                    changes += self._process_complex_graphic_children(shape, cls)
                 elif cls.role == ShapeRole.CONNECTOR:
                     changes += self._handle_connector_arrowheads(shape)
 
@@ -660,8 +676,11 @@ class SlideContentTransformerV2:
             if not bounds_check_emu(new_left, self._slide_width):
                 return 0
 
-            if abs(new_left - int(left)) < _POSITION_TOLERANCE_EMU:
-                return 0  # Negligible change — likely centred
+            # P1-3: Bypass tolerance for LOGO — logos must always mirror
+            # even when near-centered (e.g., header/footer logos).
+            if cls.role != ShapeRole.LOGO:
+                if abs(new_left - int(left)) < _POSITION_TOLERANCE_EMU:
+                    return 0  # Negligible change — likely centred
 
             shape.left = new_left
             return 1
@@ -1049,7 +1068,8 @@ class SlideContentTransformerV2:
         Flexible translation lookup with fallbacks:
         1. Exact match on full/stripped text
         2. Case-insensitive exact match
-        3. Longest prefix match (>80% of text length, for text >40 chars)
+        3. Normalized whitespace match (collapses internal whitespace)
+        4. Longest prefix match (>80% of text length, for text >40 chars)
         """
         if not text or not text.strip():
             return None
@@ -1066,7 +1086,13 @@ class SlideContentTransformerV2:
         if result:
             return result
 
-        # 3. Longest prefix match for long text
+        # 3. Normalized whitespace match (collapses tabs, double-spaces, etc.)
+        normalized = ' '.join(stripped.split()).lower()
+        result = self._translations_normalized.get(normalized)
+        if result:
+            return result
+
+        # 4. Longest prefix match for long text
         if len(stripped) > 40:
             prefix_40 = stripped[:40]
             best_match = None
@@ -1108,6 +1134,12 @@ class SlideContentTransformerV2:
 
                 arabic_text = self._fuzzy_lookup_translation(para_text)
                 if not arabic_text:
+                    # Log untranslated paragraphs for debugging (skip short/trivial text)
+                    if len(para_text.strip()) > 10 and not has_arabic(para_text):
+                        logger.warning(
+                            '_apply_translation: no match for "%s" (%d chars)',
+                            para_text.strip()[:80], len(para_text.strip()),
+                        )
                     continue
 
                 runs = para.runs
@@ -1819,6 +1851,35 @@ class SlideContentTransformerV2:
 
         return changes
 
+    def _process_complex_graphic_children(
+        self, group_shape, cls: ShapeClassification
+    ) -> int:
+        """
+        P1-2: Complex graphic handler — translate text ONLY.
+        Unlike _process_group_children, this does NOT reverse directions
+        or change any child positions. Hard rule: complex shapes and
+        graphics should only be translated, not mirrored.
+        """
+        changes = 0
+        for child in self._collect_text_shapes_from_group(group_shape):
+            changes += self._apply_translation(child)
+            child_cls = ShapeClassification(
+                role=ShapeRole.CONTENT_TEXT,
+                position_action='keep',
+                text_action='translate_rtl',
+                direction_action='none',
+                rule_name='complex_graphic_child',
+            )
+            changes += self._set_rtl_alignment(child, child_cls)
+
+            # Tables/charts inside complex graphics still get RTL treatment
+            if getattr(child, 'has_table', False) and child.has_table:
+                changes += self._handle_table(child)
+            if getattr(child, 'has_chart', False) and child.has_chart:
+                changes += self._handle_chart(child)
+
+        return changes
+
     def _reverse_child_direction(self, child) -> int:
         """Reverse directional shapes and connectors inside a group."""
         changes = 0
@@ -2276,39 +2337,53 @@ class SlideContentTransformerV2:
                             pass
 
                 char_count = len(shape_text.replace('\n', ''))
+
+                # P0-6: Skip Fix 22 entirely for already-small fonts (≤12pt)
+                # Arabic at 12pt or below has no headroom for reduction
+                if max_font_hundredths > 0 and max_font_hundredths <= 1200:
+                    continue
+
                 if max_font_hundredths > 0 and box_width_emu and box_width_emu > 0:
                     font_pt = max_font_hundredths / 100
-                    estimated_char_width_emu = 0.6 * font_pt * 12700
+                    # P1-1: Fixed overflow estimation constants
+                    # Arabic glyphs avg ~0.45x em (was 0.6x), removed 1.3x padding
+                    estimated_char_width_emu = 0.45 * font_pt * 12700
                     lines = shape_text.split('\n')
                     max_line_chars = max(
                         (len(l.strip()) for l in lines), default=char_count,
                     )
                     estimated_line_width = (
-                        max_line_chars * estimated_char_width_emu * 1.3
+                        max_line_chars * estimated_char_width_emu
                     )
                     overflow_ratio = estimated_line_width / box_width_emu
 
                     height_overflow = 0.0
                     if box_height_emu and box_height_emu > 0:
                         line_count = len(lines)
-                        estimated_line_height = font_pt * 12700 * 1.5
+                        # Realistic OOXML default line spacing (was 1.5x)
+                        estimated_line_height = font_pt * 12700 * 1.15
                         estimated_total_height = line_count * estimated_line_height
                         height_overflow = estimated_total_height / box_height_emu
 
-                    threshold = 0.9
+                    # Require genuine overflow before triggering (was 0.9 = 90% fill)
+                    threshold = 1.1
                     if (
                         max_font_hundredths >= 2400
                         and box_width_emu > self._slide_width * 0.40
                     ):
-                        threshold = 1.2
+                        threshold = 1.3
                     if overflow_ratio < threshold and height_overflow < threshold:
                         continue
 
                     max_overflow = max(overflow_ratio, height_overflow)
-                    font_scale = max(int(100000 / max_overflow), 50000)
+                    # P0-5: Raised scale floor from 50% to 70% (prevents extreme shrink)
+                    font_scale = max(int(100000 / max_overflow), 70000)
                     font_scale = min(font_scale, 100000)
                 else:
-                    font_scale = 90000
+                    # P0-4: Cannot measure overflow without explicit font size.
+                    # Was: font_scale = 90000 (blind 10% reduction on ALL theme-inherited fonts)
+                    # Now: skip — let normAutofit handle rendering without destructive reduction
+                    continue
 
                 # Remove existing autofit variants
                 for child_tag in ('spAutoFit', 'noAutofit'):
@@ -2326,7 +2401,7 @@ class SlideContentTransformerV2:
                         if run.font.size is not None:
                             original = int(run.font.size)
                             new_size = max(
-                                int(original * font_scale_ratio), 8 * 12700,
+                                int(original * font_scale_ratio), 12 * 12700,  # 12pt min for Arabic readability
                             )
                             run.font.size = new_size
                         else:
@@ -2347,7 +2422,7 @@ class SlideContentTransformerV2:
                                     break
                             if default_sz:
                                 new_sz = max(
-                                    int(default_sz * font_scale_ratio), 800,
+                                    int(default_sz * font_scale_ratio), 1200,  # 1200 hundredths = 12pt min
                                 )
                                 rPr.set('sz', str(new_sz))
 
