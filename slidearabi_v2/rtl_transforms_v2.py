@@ -803,27 +803,40 @@ class SlideContentTransformerV2:
         self, shapes: List, result: 'SlideClassificationResult'
     ) -> int:
         """
-        Phase 3.6: Fix shapes overlaid on tables (check marks, X marks, icons).
+        Phase 3.6: Fix shapes overlaid on PHYSICALLY-REVERSED tables.
 
-        After table columns are physically reversed, overlay icons that were
-        mirrored around slide center are now misaligned with their target
-        columns. Re-mirror them around the TABLE's center instead.
+        After table columns are physically reversed in XML, overlay icons
+        that were mirrored around slide center are now misaligned with their
+        target columns. Re-mirror them around the TABLE's center instead.
+
+        Round 3 fix (5-model consensus): Only applies to tables that were
+        physically reversed (have physRtlCols='1' marker). For logical-RTL-only
+        tables (tblPr rtl='1' without physical reversal), the XML column
+        positions haven't changed, so overlay icons stay where they are.
 
         Detection: small shape whose center falls inside a table's bbox.
         Transform: new_left = table_left + (table_width - (old_left - table_left) - shape_width)
         """
-        # Collect table bounding boxes
+        # Collect ONLY physically-reversed table bounding boxes
+        marker_attr = f'{{{SLIDEARABI_NS}}}physRtlCols'
         tables = []
         for shape in shapes:
             cls = result.get(shape)
             if cls.role == ShapeRole.TABLE:
                 try:
+                    # Only target tables that were physically reversed
+                    table = shape.table
+                    tbl_elem = table._tbl
+                    tbl_pr = tbl_elem.find(f'{{{A_NS}}}tblPr')
+                    if tbl_pr is None or tbl_pr.get(marker_attr) != '1':
+                        continue  # Logical-RTL only — no icon remap needed
+
                     t_left = int(shape.left or 0)
                     t_top = int(shape.top or 0)
                     t_width = int(shape.width or 0)
                     t_height = int(shape.height or 0)
                     tables.append((shape, t_left, t_top, t_width, t_height))
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, AttributeError):
                     continue
 
         if not tables:
@@ -863,8 +876,8 @@ class SlideContentTransformerV2:
                         and t_top - margin <= s_center_y <= t_top + t_height + margin
                         and s_area <= t_area * MAX_OVERLAY_AREA_FRACTION):
 
-                    # This shape is overlaid on the table — re-mirror around table center
-                    # Undo slide-center mirror, then apply table-center mirror
+                    # This shape is overlaid on a physically-reversed table —
+                    # re-mirror around table center
                     new_left = t_left + (t_width - (s_left - t_left) - s_width)
 
                     # Bounds check
@@ -877,7 +890,7 @@ class SlideContentTransformerV2:
                         shape.left = int(new_left)
                         changes += 1
                         logger.debug(
-                            'Table overlay icon "%s": left %d → %d (table-local mirror)',
+                            'Table overlay icon "%s": left %d → %d (physical-table remap)',
                             getattr(shape, 'name', '?'), s_left, new_left,
                         )
                     break  # Only match one table per shape
@@ -1415,21 +1428,39 @@ class SlideContentTransformerV2:
     # Role-specific handlers
     # ─────────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _table_needs_physical_reversal(tbl_pr) -> bool:
+        """
+        Determine if a table requires physical column reversal.
+
+        Returns True ONLY when `tableStyleId` is present and non-empty,
+        indicating a potentially unresolvable style ID (e.g., Google Slides
+        GUID exports) where PowerPoint may silently ignore `tblPr rtl='1'`.
+
+        Tables with absent/empty `tableStyleId` (including Google Slides
+        exports with no style) work correctly with `rtl='1'` alone.
+
+        Round 3 fix — 5-model consensus.
+        """
+        if tbl_pr is None:
+            return False
+        style_id = tbl_pr.get('tableStyleId', '').strip()
+        return bool(style_id)
+
     def _handle_table(self, shape) -> int:
         """
         Transform table for RTL.
 
-        Strategy (5-model consensus, Round 2):
-        1) Set tblPr rtl='1'
-        2) Physically reverse table columns exactly once:
-           - reverse <a:tblGrid>/<a:gridCol> order
-           - reverse <a:tr>/<a:tc> order per row
-        3) Translate cell text + set paragraph RTL properties
+        Strategy (5-model consensus, Round 3):
+        1) Set tblPr rtl='1' — primary RTL mechanism
+        2) Physically reverse columns ONLY when tableStyleId is present
+           (potential unresolvable Google GUID where rtl='1' is ignored)
+        3) Translate cell text
+        4) Set paragraph RTL properties + conservative alignment fix
 
-        Physical reversal is needed because tblPr rtl='1' alone
-        is unreliable for Google Slides-exported tables (unresolvable
-        tableStyleId GUIDs cause PowerPoint to ignore the RTL flag).
-        Idempotency marker prevents double-reversal across re-runs.
+        Round 3 correction: Tables with empty/absent tableStyleId work
+        correctly with rtl='1' alone. Physical reversal + rtl='1' on
+        these tables causes DOUBLE-REVERSAL (columns back to LTR).
         """
         changes = 0
         try:
@@ -1440,7 +1471,7 @@ class SlideContentTransformerV2:
 
             tbl_elem = table._tbl
 
-            # Ensure table-level rtl='1'
+            # Ensure table-level tblPr exists
             tbl_pr = tbl_elem.find(f'{{{A_NS}}}tblPr')
             if tbl_pr is None:
                 tbl_pr = etree.Element(f'{{{A_NS}}}tblPr')
@@ -1450,22 +1481,44 @@ class SlideContentTransformerV2:
                     tbl_elem.insert(idx, tbl_pr)
                 else:
                     tbl_elem.insert(0, tbl_pr)
+
+            # Always set logical RTL at table level
             if tbl_pr.get('rtl') != '1':
                 tbl_pr.set('rtl', '1')
                 changes += 1
 
-            # Physical column reversal ONCE (idempotency marker)
+            # Physical column reversal — ONLY for tables with unresolvable
+            # tableStyleId (e.g., Google Slides GUID exports).
+            # Tables with no tableStyleId work with rtl='1' alone.
             marker_attr = f'{{{SLIDEARABI_NS}}}physRtlCols'
-            if tbl_pr.get(marker_attr) != '1':
+            needs_physical = self._table_needs_physical_reversal(tbl_pr)
+
+            if needs_physical and tbl_pr.get(marker_attr) != '1':
                 changes += self._physically_reverse_table_columns(tbl_elem)
                 tbl_pr.set(marker_attr, '1')
-                # Swap firstCol/lastCol toggles if present
+                # Swap firstCol/lastCol toggles when physical order changed
                 first_col = tbl_pr.get('firstCol')
                 last_col = tbl_pr.get('lastCol')
                 if first_col or last_col:
                     tbl_pr.set('firstCol', last_col or '0')
                     tbl_pr.set('lastCol', first_col or '0')
                 changes += 1
+                logger.debug(
+                    'Table "%s": physical reversal applied (tableStyleId present)',
+                    getattr(shape, 'name', '?'),
+                )
+            elif not needs_physical:
+                # Clear stale marker from prior buggy runs to prevent
+                # downstream Phase 3.6 from incorrectly repositioning icons
+                if tbl_pr.get(marker_attr):
+                    try:
+                        del tbl_pr.attrib[marker_attr]
+                    except (KeyError, ValueError):
+                        pass
+                logger.debug(
+                    'Table "%s": logical RTL only (no tableStyleId)',
+                    getattr(shape, 'name', '?'),
+                )
 
             # Translate cell text
             if self.translations:
@@ -1474,7 +1527,7 @@ class SlideContentTransformerV2:
                         if cell.text_frame:
                             changes += self._translate_cell_text(cell.text_frame)
 
-            # Set RTL properties on cell text
+            # Set RTL properties on cell text (includes alignment fix)
             for row in table.rows:
                 for col_idx, cell in enumerate(row.cells):
                     if cell.text_frame:
@@ -1548,33 +1601,48 @@ class SlideContentTransformerV2:
     ) -> None:
         """Set RTL paragraph properties on cell text.
 
-        IMPORTANT: Only set rtl='1'/'0' on paragraphs.  Do NOT override
-        the original cell alignment (algn).  The author's alignment is the
-        layout intent within the column — forcing algn='r' on originally
-        left-aligned cells causes right-anchored text to overflow and get
-        clipped in narrow cells.  tblPr rtl='1' handles the column visual
-        reordering; cell-internal alignment must be preserved.
-        (Round 11, 5/5 model consensus)
+        Round 3 fix (5-model consensus):
+        - Arabic paragraphs: set rtl='1' + mirror algn='l' → 'r'
+        - Non-Arabic paragraphs: set rtl='0', keep original alignment
+        - Preserve center ('ctr'), right ('r'), justified ('just') alignment
+
+        The Round 11 rule ("never override algn") was correct when physical
+        column reversal was the mechanism. With logical RTL (tblPr rtl='1'
+        only), cell-internal alignment still refers to the cell's own edges,
+        so Arabic body text at algn='l' anchors to the wrong edge.
         """
         try:
+            has_any_arabic = False
+
             for para in text_frame.paragraphs:
                 text = para.text or ''
                 if not text.strip():
                     continue
                 pPr = ensure_pPr(para._p)
-                if has_arabic(text):
+                para_has_arabic = has_arabic(text)
+
+                if para_has_arabic:
+                    has_any_arabic = True
                     pPr.set('rtl', '1')
+                    # Conservative alignment normalization:
+                    # only mirror explicit left → right for Arabic text.
+                    # Keep ctr, just, dist, r unchanged.
+                    algn = pPr.get('algn')
+                    if algn == 'l' or (algn is None):
+                        pPr.set('algn', 'r')
                 else:
                     pPr.set('rtl', '0')
-                # Do NOT set algn — preserve the original cell alignment
+                    # Non-Arabic: keep original alignment
 
-            # Only set rtlCol when cell actually has Arabic content
-            # (setting it on English-only cells causes column direction issues)
-            cell_text = ''.join(p.text or '' for p in text_frame.paragraphs)
-            if has_arabic(cell_text):
-                body_pr = text_frame._txBody.find(f'{{{A_NS}}}bodyPr')
-                if body_pr is not None:
+            # Set rtlCol only when cell includes Arabic content
+            body_pr = text_frame._txBody.find(f'{{{A_NS}}}bodyPr')
+            if body_pr is not None:
+                if has_any_arabic:
                     body_pr.set('rtlCol', '1')
+                else:
+                    # Remove stale rtlCol from prior runs
+                    if 'rtlCol' in body_pr.attrib:
+                        del body_pr.attrib['rtlCol']
         except Exception:
             pass
 
