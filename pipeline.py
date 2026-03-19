@@ -567,9 +567,20 @@ class SlideArabiPipeline:
                 for shape in slide.shapes:
                     for para in shape.paragraphs:
                         # Combine runs into a single translatable string per paragraph
-                        para_text = "".join(run.text for run in para.runs if run.text).strip()
-                        if para_text:
-                            texts.append(para_text)
+                        # Use para.text to match Phase 3's _apply_translation lookup key
+                        # (includes <a:fld> field elements that .runs misses)
+                        para_text_from_runs = "".join(run.text for run in para.runs if run.text).strip()
+                        if para_text_from_runs:
+                            texts.append(para_text_from_runs)
+                            # Also index the text as python-pptx para.text would see it
+                            # to prevent lookup mismatches in Phase 3
+                            try:
+                                alt_text = para.text.strip() if hasattr(para, 'text') else None
+                                if alt_text and alt_text != para_text_from_runs and alt_text not in seen:
+                                    texts.append(alt_text)
+                                    seen.add(alt_text)
+                            except Exception:
+                                pass
 
             # Deduplicate while preserving order
             seen = set()
