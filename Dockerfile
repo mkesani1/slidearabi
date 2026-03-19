@@ -32,6 +32,10 @@ COPY . /app/slidearabi/
 # Ensure __init__.py exists
 RUN test -f /app/slidearabi/__init__.py || echo "" > /app/slidearabi/__init__.py
 
+# V2 engine: symlink slidearabi_v2 as a top-level package so both
+# 'from slidearabi_v2.xxx' and 'from slidearabi.slidearabi_v2.xxx' resolve
+RUN ln -sf /app/slidearabi/slidearabi_v2 /app/slidearabi_v2
+
 # Create tmp dir for job files
 RUN mkdir -p /tmp/slideshift_jobs
 
