@@ -52,6 +52,9 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SlideArabi namespace for idempotency markers
+SLIDEARABI_NS = 'https://slidearabi.ai/ns/transform'
+
 # Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -337,6 +340,11 @@ class SlideContentTransformerV2:
         # ── Phase 3.5: Table overlap resolution ─────────────────────
         changes += self._resolve_table_overlaps(all_shapes, result)
 
+        # ── Phase 3.6: Table overlay icon correction ───────────────
+        # Icons/shapes overlaid on tables need table-local mirroring
+        # (not slide-center mirroring) to stay aligned with reversed columns
+        changes += self._fix_table_overlay_icons(all_shapes, result)
+
         # ── Phase 4: Post-processing (text-only) ──────────────────────
         changes += self._post_process(all_shapes, result, slide_number)
 
@@ -345,6 +353,12 @@ class SlideContentTransformerV2:
             changes += self._v1_dispatcher.dispatch_post_processing(
                 all_shapes, slide_number,
             )
+
+        # ── Phase 5: Master/layout decorative shape mirroring ────────
+        # Thin decorative lines and bars from master/layout slides
+        # are not in the slide's spTree so they don't get mirrored.
+        # We detect them and add mirrored copies + occluders on the slide.
+        changes += self._mirror_master_decorative_shapes(slide, slide_number)
 
         # Telemetry
         self._log_translation_coverage(all_shapes, slide_number)
@@ -783,6 +797,93 @@ class SlideContentTransformerV2:
 
         if changes:
             logger.debug('Resolved %d table overlaps', changes)
+        return changes
+
+    def _fix_table_overlay_icons(
+        self, shapes: List, result: 'SlideClassificationResult'
+    ) -> int:
+        """
+        Phase 3.6: Fix shapes overlaid on tables (check marks, X marks, icons).
+
+        After table columns are physically reversed, overlay icons that were
+        mirrored around slide center are now misaligned with their target
+        columns. Re-mirror them around the TABLE's center instead.
+
+        Detection: small shape whose center falls inside a table's bbox.
+        Transform: new_left = table_left + (table_width - (old_left - table_left) - shape_width)
+        """
+        # Collect table bounding boxes
+        tables = []
+        for shape in shapes:
+            cls = result.get(shape)
+            if cls.role == ShapeRole.TABLE:
+                try:
+                    t_left = int(shape.left or 0)
+                    t_top = int(shape.top or 0)
+                    t_width = int(shape.width or 0)
+                    t_height = int(shape.height or 0)
+                    tables.append((shape, t_left, t_top, t_width, t_height))
+                except (TypeError, ValueError):
+                    continue
+
+        if not tables:
+            return 0
+
+        changes = 0
+        # Max overlay icon area as fraction of table area
+        MAX_OVERLAY_AREA_FRACTION = 0.05  # 5% of table area
+
+        for shape in shapes:
+            cls = result.get(shape)
+            # Only consider non-table, non-placeholder shapes
+            if cls.role in (ShapeRole.TABLE, ShapeRole.PLACEHOLDER, ShapeRole.BACKGROUND,
+                            ShapeRole.DECORATIVE, ShapeRole.BLEED):
+                continue
+
+            try:
+                s_left = int(shape.left or 0)
+                s_top = int(shape.top or 0)
+                s_width = int(shape.width or 0)
+                s_height = int(shape.height or 0)
+            except (TypeError, ValueError):
+                continue
+
+            s_area = s_width * s_height
+            s_center_x = s_left + s_width // 2
+            s_center_y = s_top + s_height // 2
+
+            for tbl_shape, t_left, t_top, t_width, t_height in tables:
+                t_area = t_width * t_height
+                if t_area <= 0:
+                    continue
+
+                # Check: shape center inside table bbox, and shape is small
+                margin = int(self._slide_width * 0.02)  # 2% slide width tolerance
+                if (t_left - margin <= s_center_x <= t_left + t_width + margin
+                        and t_top - margin <= s_center_y <= t_top + t_height + margin
+                        and s_area <= t_area * MAX_OVERLAY_AREA_FRACTION):
+
+                    # This shape is overlaid on the table — re-mirror around table center
+                    # Undo slide-center mirror, then apply table-center mirror
+                    new_left = t_left + (t_width - (s_left - t_left) - s_width)
+
+                    # Bounds check
+                    if new_left < t_left - margin:
+                        new_left = t_left
+                    if new_left + s_width > t_left + t_width + margin:
+                        new_left = t_left + t_width - s_width
+
+                    if new_left != s_left:
+                        shape.left = int(new_left)
+                        changes += 1
+                        logger.debug(
+                            'Table overlay icon "%s": left %d → %d (table-local mirror)',
+                            getattr(shape, 'name', '?'), s_left, new_left,
+                        )
+                    break  # Only match one table per shape
+
+        if changes:
+            logger.debug('Fixed %d table overlay icons', changes)
         return changes
 
     def _handle_swap(self, shape, cls: ShapeClassification, layout) -> int:
@@ -1316,14 +1417,19 @@ class SlideContentTransformerV2:
 
     def _handle_table(self, shape) -> int:
         """
-        Transform a table for RTL: set rtl='1' on tblPr,
-        translate cell text, set RTL properties on cells.
+        Transform table for RTL.
 
-        IMPORTANT: We rely SOLELY on tblPr rtl='1' for column visual
-        ordering. PowerPoint renders col 0 on the right, col 1 to its
-        left, etc. No code-level cell reversal or column-width reversal
-        is needed — and doing so would cause a double-reversal bug.
-        This also preserves gridSpan/vMerge merged-cell attributes.
+        Strategy (5-model consensus, Round 2):
+        1) Set tblPr rtl='1'
+        2) Physically reverse table columns exactly once:
+           - reverse <a:tblGrid>/<a:gridCol> order
+           - reverse <a:tr>/<a:tc> order per row
+        3) Translate cell text + set paragraph RTL properties
+
+        Physical reversal is needed because tblPr rtl='1' alone
+        is unreliable for Google Slides-exported tables (unresolvable
+        tableStyleId GUIDs cause PowerPoint to ignore the RTL flag).
+        Idempotency marker prevents double-reversal across re-runs.
         """
         changes = 0
         try:
@@ -1334,25 +1440,41 @@ class SlideContentTransformerV2:
 
             tbl_elem = table._tbl
 
-            # Translate cell text (before setting RTL properties)
+            # Ensure table-level rtl='1'
+            tbl_pr = tbl_elem.find(f'{{{A_NS}}}tblPr')
+            if tbl_pr is None:
+                tbl_pr = etree.Element(f'{{{A_NS}}}tblPr')
+                tbl_grid = tbl_elem.find(f'{{{A_NS}}}tblGrid')
+                if tbl_grid is not None:
+                    idx = list(tbl_elem).index(tbl_grid)
+                    tbl_elem.insert(idx, tbl_pr)
+                else:
+                    tbl_elem.insert(0, tbl_pr)
+            if tbl_pr.get('rtl') != '1':
+                tbl_pr.set('rtl', '1')
+                changes += 1
+
+            # Physical column reversal ONCE (idempotency marker)
+            marker_attr = f'{{{SLIDEARABI_NS}}}physRtlCols'
+            if tbl_pr.get(marker_attr) != '1':
+                changes += self._physically_reverse_table_columns(tbl_elem)
+                tbl_pr.set(marker_attr, '1')
+                # Swap firstCol/lastCol toggles if present
+                first_col = tbl_pr.get('firstCol')
+                last_col = tbl_pr.get('lastCol')
+                if first_col or last_col:
+                    tbl_pr.set('firstCol', last_col or '0')
+                    tbl_pr.set('lastCol', first_col or '0')
+                changes += 1
+
+            # Translate cell text
             if self.translations:
                 for row in table.rows:
                     for cell in row.cells:
                         if cell.text_frame:
                             changes += self._translate_cell_text(cell.text_frame)
 
-            # DO NOT reverse column widths — tblPr rtl='1' handles display order
-            # DO NOT reverse cell order — tblPr rtl='1' handles display order
-
-            # Set table-level RTL (PowerPoint renders col 0 on right)
-            tbl_pr = tbl_elem.find(f'{{{A_NS}}}tblPr')
-            if tbl_pr is None:
-                tbl_pr = etree.SubElement(tbl_elem, f'{{{A_NS}}}tblPr')
-                tbl_elem.insert(0, tbl_pr)
-            tbl_pr.set('rtl', '1')
-            changes += 1
-
-            # RTL properties on cell text
+            # Set RTL properties on cell text
             for row in table.rows:
                 for col_idx, cell in enumerate(row.cells):
                     if cell.text_frame:
@@ -1366,6 +1488,38 @@ class SlideContentTransformerV2:
                 '_handle_table on "%s": %s',
                 getattr(shape, 'name', '?'), exc,
             )
+        return changes
+
+    def _physically_reverse_table_columns(self, tbl_elem) -> int:
+        """
+        Reverse gridCol order and cell order in every row.
+        Preserves each cell node (including merge/format attrs) by
+        moving XML nodes, not recreating them.
+        """
+        changes = 0
+
+        # 1) Reverse <a:gridCol> order in <a:tblGrid>
+        tbl_grid = tbl_elem.find(f'{{{A_NS}}}tblGrid')
+        if tbl_grid is not None:
+            grid_cols = list(tbl_grid.findall(f'{{{A_NS}}}gridCol'))
+            if len(grid_cols) > 1:
+                for gc in grid_cols:
+                    tbl_grid.remove(gc)
+                for gc in reversed(grid_cols):
+                    tbl_grid.append(gc)
+                changes += 1
+
+        # 2) Reverse <a:tc> order in each <a:tr>
+        for tr in tbl_elem.findall(f'{{{A_NS}}}tr'):
+            cells = list(tr.findall(f'{{{A_NS}}}tc'))
+            if len(cells) <= 1:
+                continue
+            for tc in cells:
+                tr.remove(tc)
+            for tc in reversed(cells):
+                tr.append(tc)
+            changes += 1
+
         return changes
 
     def _translate_cell_text(self, text_frame) -> int:
@@ -2040,6 +2194,126 @@ class SlideContentTransformerV2:
                         )
                 except Exception:
                     pass
+
+        return changes
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Phase 5: Master/layout decorative shape mirroring
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _mirror_master_decorative_shapes(self, slide, slide_number: int) -> int:
+        """
+        Detect thin decorative shapes (lines, bars) inherited from the master
+        or layout slide and add mirrored copies on the slide layer.
+
+        These shapes live in slideLayout/slideMaster XML and are not part of
+        the slide's spTree, so Phase 3 never sees them.
+
+        Strategy (per Codex 5.3 / Sonnet 4.6):
+        - Scan the slide's layout and master for non-placeholder shapes
+        - Identify thin vertical/horizontal lines or bars (width or height < 3% slide dim)
+        - Clone them onto the slide spTree at the mirrored X position
+        - Add a same-background occluder at the original position to hide the inherited one
+        """
+        changes = 0
+        try:
+            slide_layout = slide.slide_layout
+            sources = [slide_layout]
+            if hasattr(slide_layout, 'slide_master'):
+                sources.append(slide_layout.slide_master)
+
+            thin_threshold_w = int(self._slide_width * 0.03)  # 3% of slide width
+            thin_threshold_h = int(self._slide_height * 0.03)
+
+            spTree = slide._element.find(f'.//{{{P_NS}}}spTree')
+            if spTree is None:
+                return 0
+
+            for source in sources:
+                if source is None:
+                    continue
+                try:
+                    source_shapes = source.shapes
+                except Exception:
+                    continue
+
+                for shape in source_shapes:
+                    # Skip placeholders (they have their own handling)
+                    try:
+                        if getattr(shape, 'placeholder_format', None) is not None:
+                            continue
+                    except Exception:
+                        pass
+
+                    try:
+                        s_left = int(shape.left or 0)
+                        s_top = int(shape.top or 0)
+                        s_width = int(shape.width or 0)
+                        s_height = int(shape.height or 0)
+                    except (TypeError, ValueError):
+                        continue
+
+                    # Only target thin decorative shapes (lines, thin bars)
+                    is_thin = (s_width < thin_threshold_w or s_height < thin_threshold_h)
+                    if not is_thin:
+                        continue
+
+                    # Check if off-center (not already centered)
+                    center = s_left + s_width // 2
+                    slide_center = self._slide_width // 2
+                    if abs(center - slide_center) < _POSITION_TOLERANCE_EMU:
+                        continue  # Already centered, no need to mirror
+
+                    # Mirror the position
+                    new_left = mirror_x(s_left, s_width, self._slide_width)
+                    if abs(new_left - s_left) < _POSITION_TOLERANCE_EMU:
+                        continue
+
+                    # Clone the shape element to the slide spTree at mirrored position
+                    cloned = deepcopy(shape._element)
+                    xfrm = cloned.find(f'.//{{{A_NS}}}xfrm')
+                    if xfrm is not None:
+                        off = xfrm.find(f'{{{A_NS}}}off')
+                        if off is not None:
+                            off.set('x', str(new_left))
+
+                    spTree.append(cloned)
+                    changes += 1
+
+                    # Add occluder rectangle at original position to hide inherited shape
+                    # (simple white/background-colored rectangle)
+                    occluder = etree.SubElement(spTree, f'{{{P_NS}}}sp')
+                    nvSpPr = etree.SubElement(occluder, f'{{{P_NS}}}nvSpPr')
+                    cNvPr = etree.SubElement(nvSpPr, f'{{{P_NS}}}cNvPr')
+                    cNvPr.set('id', '0')
+                    cNvPr.set('name', 'SlideArabi Occluder')
+                    cNvSpPr = etree.SubElement(nvSpPr, f'{{{P_NS}}}cNvSpPr')
+                    nvPr = etree.SubElement(nvSpPr, f'{{{P_NS}}}nvPr')
+                    sp_pr = etree.SubElement(occluder, f'{{{P_NS}}}spPr')
+                    occ_xfrm = etree.SubElement(sp_pr, f'{{{A_NS}}}xfrm')
+                    occ_off = etree.SubElement(occ_xfrm, f'{{{A_NS}}}off')
+                    occ_off.set('x', str(s_left))
+                    occ_off.set('y', str(s_top))
+                    occ_ext = etree.SubElement(occ_xfrm, f'{{{A_NS}}}ext')
+                    occ_ext.set('cx', str(s_width))
+                    occ_ext.set('cy', str(s_height))
+                    prstGeom = etree.SubElement(sp_pr, f'{{{A_NS}}}prstGeom')
+                    prstGeom.set('prst', 'rect')
+                    # Match background (white fill)
+                    solidFill = etree.SubElement(sp_pr, f'{{{A_NS}}}solidFill')
+                    srgbClr = etree.SubElement(solidFill, f'{{{A_NS}}}srgbClr')
+                    srgbClr.set('val', 'FFFFFF')
+                    # No outline
+                    ln = etree.SubElement(sp_pr, f'{{{A_NS}}}ln')
+                    noFill = etree.SubElement(ln, f'{{{A_NS}}}noFill')
+
+                    logger.debug(
+                        'Slide %d: mirrored master line "%s" left %d → %d + occluder',
+                        slide_number, getattr(shape, 'name', '?'), s_left, new_left,
+                    )
+
+        except Exception as exc:
+            logger.warning('_mirror_master_decorative_shapes slide %d: %s', slide_number, exc)
 
         return changes
 
