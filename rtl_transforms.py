@@ -97,10 +97,25 @@ _LOGO_MAX_WIDTH_FRACTION = 0.20
 _POSITION_TOLERANCE_EMU = 50_000  # ≈ 0.055 inches
 
 # Placeholder type strings that are "title-like" (keep centered or right-align)
-_TITLE_PH_TYPES = frozenset({'title', 'ctrTitle', 'center_title'})
+# NOTE: get_placeholder_info() now returns normalized names (e.g. 'title' not 'title (1)')
+_TITLE_PH_TYPES = frozenset({
+    'title', 'center_title', 'subtitle', 'vertical_title',
+    'ctrTitle',  # legacy/OOXML alias
+})
 
 # Placeholder type strings that should always be left-aligned (footers, dates)
-_FOOTER_PH_TYPES = frozenset({'ftr', 'sldNum', 'dt', 'footer', 'slideNumber', 'date_time'})
+_FOOTER_PH_TYPES = frozenset({
+    'footer', 'slide_number', 'date', 'date_time', 'header',
+    'ftr', 'sldNum', 'dt', 'slideNumber',  # legacy/OOXML aliases
+})
+
+# Placeholder types eligible for two-column swap (whitelist).
+# Only true content-bearing types participate in column swapping.
+# Everything else (chrome, navigation, metadata) is mirrored individually.
+_SWAPPABLE_CONTENT_TYPES = frozenset({
+    'body', 'object', 'chart', 'table', 'media_clip',
+    'org_chart', 'bitmap', 'picture', 'vertical_body', 'vertical_object',
+})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -629,83 +644,135 @@ class MasterLayoutTransformer:
         Swap the horizontal positions of the two content-area placeholders
         in a two-column layout.
 
-        Identifies the left and right column placeholders by comparing their
-        X positions, then swaps using the mirror formula so each ends up on
-        the opposite side at the correct RTL position.
+        Uses a WHITELIST (_SWAPPABLE_CONTENT_TYPES) to identify which
+        placeholders represent actual content columns.  Only body/object-type
+        placeholders participate in the column swap.  Everything else (title,
+        subtitle, slide_number, footer, date, etc.) is mirrored individually.
 
-        The title placeholder (idx=0) is mirrored separately, not swapped.
+        Uses _set_layout_placeholder_position (Fix 21) for all position writes
+        to preserve full xfrm geometry (x, y, cx, cy).
 
         Returns:
             Count of position changes applied.
         """
         changes = 0
-        content_placeholders = []
-        title_placeholders = []
+        swap_candidates = []      # body/object types → column swap
+        mirror_individually = []  # everything else → simple mirror
 
         for shape in layout.placeholders:
             ph_info = get_placeholder_info(shape)
             if ph_info is None:
                 continue
             ph_type, ph_idx = ph_info
-            if ph_type in _TITLE_PH_TYPES or ph_idx == 0:
-                title_placeholders.append(shape)
+            if ph_type in _SWAPPABLE_CONTENT_TYPES:
+                swap_candidates.append(shape)
             else:
-                content_placeholders.append(shape)
+                mirror_individually.append(shape)
 
-        # Mirror title placeholders individually
-        for shape in title_placeholders:
+        # Mirror non-swappable placeholders (title, subtitle, slide_number,
+        # footer, date, etc.) individually using Fix 21 geometry writes.
+        for shape in mirror_individually:
             try:
                 left, width = shape.left, shape.width
                 if left is None or width is None:
                     continue
                 new_left = mirror_x(left, width, slide_width)
-                if bounds_check_emu(new_left, slide_width) and abs(new_left - left) >= _POSITION_TOLERANCE_EMU:
-                    shape.left = new_left
-                    changes += 1
+                if not bounds_check_emu(new_left, slide_width):
+                    continue
+                if abs(new_left - left) < _POSITION_TOLERANCE_EMU:
+                    continue
+                self._set_layout_placeholder_position(
+                    shape, new_left, shape.top, shape.width, shape.height
+                )
+                changes += 1
             except Exception as exc:
-                logger.debug('title mirror: %s', exc)
+                logger.debug('mirror non-swappable PH: %s', exc)
 
-        # Sort content placeholders left-to-right
-        content_placeholders.sort(key=lambda s: getattr(s, 'left', 0) or 0)
+        # Sort swap candidates left-to-right
+        swap_candidates.sort(key=lambda s: getattr(s, 'left', 0) or 0)
 
-        if len(content_placeholders) >= 2:
-            # Swap the leftmost and rightmost
-            left_ph = content_placeholders[0]
-            right_ph = content_placeholders[-1]
+        if len(swap_candidates) == 2:
+            # Canonical two-column swap
+            left_ph = swap_candidates[0]
+            right_ph = swap_candidates[1]
             try:
                 new_x_left, new_x_right = swap_positions(
                     left_ph.left, left_ph.width,
                     right_ph.left, right_ph.width,
                     slide_width,
                 )
-                left_ph.left = clamp_emu(new_x_left, slide_width)
-                right_ph.left = clamp_emu(new_x_right, slide_width)
+                new_x_left = clamp_emu(new_x_left, slide_width)
+                new_x_right = clamp_emu(new_x_right, slide_width)
+                self._set_layout_placeholder_position(
+                    left_ph, new_x_left, left_ph.top,
+                    left_ph.width, left_ph.height
+                )
+                self._set_layout_placeholder_position(
+                    right_ph, new_x_right, right_ph.top,
+                    right_ph.width, right_ph.height
+                )
                 changes += 2
+                logger.debug(
+                    'Two-column swap: idx=%s (%.2f"→%.2f") ↔ idx=%s (%.2f"→%.2f")',
+                    getattr(left_ph, 'placeholder_format', None)
+                    and left_ph.placeholder_format.idx,
+                    int(left_ph.left) / 914400 if left_ph.left else 0,
+                    new_x_left / 914400,
+                    getattr(right_ph, 'placeholder_format', None)
+                    and right_ph.placeholder_format.idx,
+                    int(right_ph.left) / 914400 if right_ph.left else 0,
+                    new_x_right / 914400,
+                )
             except Exception as exc:
                 logger.warning('_swap_two_column_placeholders: %s', exc)
 
-            # Mirror any remaining content placeholders individually
-            for shape in content_placeholders[1:-1]:
+        elif len(swap_candidates) >= 3:
+            # 3+ content placeholders: swap the two outermost, mirror the rest
+            left_ph = swap_candidates[0]
+            right_ph = swap_candidates[-1]
+            try:
+                new_x_left, new_x_right = swap_positions(
+                    left_ph.left, left_ph.width,
+                    right_ph.left, right_ph.width,
+                    slide_width,
+                )
+                self._set_layout_placeholder_position(
+                    left_ph, clamp_emu(new_x_left, slide_width),
+                    left_ph.top, left_ph.width, left_ph.height
+                )
+                self._set_layout_placeholder_position(
+                    right_ph, clamp_emu(new_x_right, slide_width),
+                    right_ph.top, right_ph.width, right_ph.height
+                )
+                changes += 2
+            except Exception as exc:
+                logger.warning('_swap_two_column_placeholders (3+): %s', exc)
+            # Mirror middle candidates individually
+            for shape in swap_candidates[1:-1]:
                 try:
                     left, width = shape.left, shape.width
                     if left is None or width is None:
                         continue
                     new_left = mirror_x(left, width, slide_width)
                     if bounds_check_emu(new_left, slide_width):
-                        shape.left = new_left
+                        self._set_layout_placeholder_position(
+                            shape, new_left, shape.top, shape.width, shape.height
+                        )
                         changes += 1
                 except Exception as exc:
                     logger.debug('extra content mirror: %s', exc)
 
-        elif len(content_placeholders) == 1:
+        elif len(swap_candidates) == 1:
             # Single content placeholder — just mirror it
-            shape = content_placeholders[0]
+            shape = swap_candidates[0]
             try:
                 left, width = shape.left, shape.width
                 if left is not None and width is not None:
                     new_left = mirror_x(left, width, slide_width)
                     if bounds_check_emu(new_left, slide_width):
-                        shape.left = new_left
+                        self._set_layout_placeholder_position(
+                            shape, new_left, shape.top, shape.width, shape.height
+                        )
                         changes += 1
             except Exception as exc:
                 logger.debug('single content mirror: %s', exc)
@@ -895,19 +962,27 @@ class SlideContentTransformer:
             all_shapes, slide_number, panel_handled_shapes
         )
 
+        # Fix 24 (Round 2: active): Detect slide-level shapes that duplicate
+        # master/layout shapes. Skip mirroring them so the slide-level shape
+        # stays aligned with its master counterpart (prevents duplication or
+        # occlusion after RTL mirror).
+        self._skip_master_layout_duplicates(
+            slide, all_shapes, slide_number, panel_handled_shapes
+        )
+
         individually_mirrored_shapes = set()  # shape ids mirrored by per-shape loop
 
         for shape in all_shapes:
             try:
                 # Fix 5: Handle group shapes as a single unit
                 if hasattr(shape, 'shapes') and not getattr(shape, 'is_placeholder', False):
-                    # Mirror the group's position as a unit (unless already handled by panel swap)
-                    if id(shape) not in panel_handled_shapes:
-                        if self._should_mirror_shape(shape, layout_type):
-                            if self._mirror_freeform_shape(shape, self._slide_width):
-                                changes += 1
-                                individually_mirrored_shapes.add(id(shape))
-                    # Process text in group children (no position mirroring)
+                    # ── Process children FIRST ──
+                    # Child text/table/chart/directional transforms must run
+                    # before group position mirroring. Some python-pptx
+                    # operations on children can trigger
+                    # recalculate_extents() which resets the group's offset.
+                    # By mirroring the group position LAST, any such
+                    # recalculation is overwritten with the correct value.
                     for child in self._collect_text_shapes_from_group(shape):
                         changes += self._apply_translation(child, self.translations)
                         changes += self._set_rtl_alignment_unconditional(child)
@@ -923,6 +998,27 @@ class SlideContentTransformer:
                             changes += self._reverse_directional_shape(child)
                             changes += self._reverse_connector_direction(child)
                             changes += self._reverse_line_arrowheads(child)
+
+                    # ── Mirror group position LAST (after child processing) ──
+                    if id(shape) not in panel_handled_shapes:
+                        if self._should_mirror_shape(shape, layout_type):
+                            if self._mirror_freeform_shape(shape, self._slide_width):
+                                changes += 1
+                                individually_mirrored_shapes.add(id(shape))
+                                # Bounds check: warn if group overflows slide
+                                try:
+                                    r_edge = int(shape.left) + int(shape.width)
+                                    if r_edge > self._slide_width + 1_500_000:
+                                        logger.warning(
+                                            'Slide %d: group "%s" OOB after mirror '
+                                            '— right edge %.2f" > slide %.2f"',
+                                            slide_number,
+                                            getattr(shape, 'name', '?'),
+                                            r_edge / 914400,
+                                            self._slide_width / 914400,
+                                        )
+                                except Exception:
+                                    pass
                     continue
 
                 # Fix 4A: Handle connector shapes (cxnSp)
@@ -976,6 +1072,24 @@ class SlideContentTransformer:
                 logger.warning('Slide %d shape "%s": %s', slide_number,
                                getattr(shape, 'name', '?'), exc)
 
+        # Fix 25: X-band column coherence for title/secHead layouts.
+        # When title-layout gating mirrors some shapes in a column but skips
+        # shorter ones (failing the h>30% check), force-mirror the stragglers
+        # so the entire column moves together.
+        if layout_type in ('secHead', 'title'):
+            changes += self._force_xband_coherence(
+                all_shapes, individually_mirrored_shapes,
+                panel_handled_shapes, slide_number,
+            )
+
+        # Post-mirror: resolve overlaps from independent mirroring.
+        # When two shapes that were originally on opposite sides both get
+        # individually mirrored, they can end up overlapping (e.g. two-column
+        # text-only layouts).  This swaps their positions back.
+        changes += self._resolve_post_mirror_text_overlaps(
+            all_shapes, individually_mirrored_shapes, slide_number
+        )
+
         # Fix 11: Fix wrap="none" text boxes for Arabic text
         for shape in all_shapes:
             try:
@@ -985,7 +1099,9 @@ class SlideContentTransformer:
                 logger.debug('Fix 11 on slide %d: %s', slide_number, exc)
 
         # Fix 12: Resolve title-body vertical overlap for RTL
-        changes += self._fix_title_body_overlap(all_shapes, slide_number)
+        changes += self._fix_title_body_overlap(
+            all_shapes, slide_number, panel_handled_shapes
+        )
 
         # Fix 22: Apply normAutofit to all Arabic-containing placeholder text frames.
         # Arabic text is 20-40% taller/wider than English at the same font size.
@@ -1019,6 +1135,18 @@ class SlideContentTransformer:
 
         # Fix 20: Move slide-number badge to top-left in RTL output
         changes += self._reposition_slide_number_badge(all_shapes, slide_number)
+
+        # Fix 23: Post-mirror z-order normalization for placeholder
+        # picture-over-text conflicts. Runs LAST after all position fixes.
+        changes += self._fix_placeholder_z_order(slide, slide_number)
+
+        # Fix 25: Resolve text-box / master-logo post-mirror overlap.
+        # After mirroring, a slide-level text box that was on the far left
+        # can land on top of a master-level logo on the right (or vice versa).
+        # Push the text box below the logo to clear the overlap.
+        changes += self._fix_text_master_logo_overlap(
+            slide, all_shapes, slide_number
+        )
 
         # Fix 9: Collision detection (log warnings for overlapping shapes)
         self._detect_collisions(all_shapes, slide_number)
@@ -1112,7 +1240,7 @@ class SlideContentTransformer:
             ph_info = get_placeholder_info_from_xml(sp_el)
             if ph_info is None:
                 return False
-            _, ph_idx = ph_info
+            ph_type, ph_idx = ph_info
 
             # Verify layout has a matching placeholder
             layout_ph = None
@@ -1311,6 +1439,46 @@ class SlideContentTransformer:
                                          ph_idx, current_left, new_left)
                     return True
 
+            # ── Symmetric-layout guard for swappable content types ────
+            # In two-column layouts where the layout placeholders are
+            # symmetric (same width, mirrored positions), the Phase 2
+            # swap_positions() call is a no-op — mirror(L1) = L2 and
+            # vice-versa, so the layout positions don't move.  If we
+            # then remove the slide-level xfrm, the shape inherits the
+            # un-swapped layout position → the panels stay on their
+            # original LTR side.
+            #
+            # Fix: for body/object content placeholders, ALWAYS mirror
+            # the slide-level position explicitly.  This handles both
+            # symmetric layouts (where layout swap is a no-op) and
+            # preserves any slide-specific size customizations.
+            # ─────────────────────────────────────────────────────────
+            current_left = shape.left
+            current_width = shape.width
+            current_height = shape.height
+
+            if (ph_type in _SWAPPABLE_CONTENT_TYPES
+                    and current_left is not None
+                    and current_width is not None):
+                slide_w = int(current_width)
+                new_left = self._slide_width - int(current_left) - slide_w
+                new_left = max(0, min(new_left, self._slide_width - slide_w))
+                if abs(new_left - int(current_left)) >= _POSITION_TOLERANCE_EMU:
+                    shape.left = new_left
+                    logger.debug(
+                        'Placeholder %d (%s): swappable-content guard — '
+                        'explicit mirror %d→%d, keeping size %dx%d.',
+                        ph_idx, ph_type,
+                        int(current_left), new_left,
+                        slide_w, int(current_height or 0),
+                    )
+                    return True
+                else:
+                    # Mirror delta is negligible (centered shape) — remove
+                    # xfrm to inherit from layout as normal.
+                    sp_pr.remove(xfrm)
+                    return True
+
             # ── Size-divergence guard ──────────────────────────────────
             # Before removing xfrm (which makes the shape inherit the layout's
             # geometry), check whether the slide-level shape's width/height
@@ -1323,10 +1491,6 @@ class SlideContentTransformer:
             # EITHER direction (larger or smaller), keep explicit geometry.
             # ─────────────────────────────────────────────────────────────
             _SIZE_DIVERGENCE_THRESHOLD = 0.30  # 30% in either direction
-
-            current_left = shape.left
-            current_width = shape.width
-            current_height = shape.height
 
             # ── Fallback: layout has zero/None dimensions ────────────────
             # If we can't read the layout's geometry, it's unsafe to inherit
@@ -2537,7 +2701,10 @@ class SlideContentTransformer:
     # Fix 12: Title-body vertical overlap resolution for RTL
     # ─────────────────────────────────────────────────────────────────────
 
-    def _fix_title_body_overlap(self, shapes: list, slide_number: int) -> int:
+    def _fix_title_body_overlap(
+        self, shapes: list, slide_number: int,
+        panel_handled_shapes: set | None = None,
+    ) -> int:
         """
         Fix 12: Detect and fix vertical overlap between title and body text boxes.
 
@@ -2546,23 +2713,28 @@ class SlideContentTransformer:
         In RTL, BOTH texts flow from the right edge, causing visual collision
         in the vertical overlap zone.
 
-        Algorithm:
-        1. Identify "title-like" shapes (large font, short text, near top of slide)
-        2. Identify "body-like" shapes (smaller font, longer text)
-        3. If a body shape's top edge is within a title shape's vertical extent,
-           move the body shape down so it clears the title + a small gap.
+        Tightened per 5-model safety review (2026-03-17):
+        - Two-tier title detection: placeholders always qualify; freeforms
+          need stricter criteria (font ≥44pt, top ≤22%, text ≤80 chars).
+        - 30% minimum horizontal overlap (was >0 — too aggressive).
+        - Skip shapes already handled by panel swap.
+        - Each body moved at most once per slide.
 
         Returns:
             Count of shapes repositioned.
         """
         changes = 0
         GAP_EMU = 91440  # 0.1 inch gap
+        _panel_ids = panel_handled_shapes or set()
 
         # Collect text shapes with their geometry
         text_shapes = []
         for shape in shapes:
             try:
                 if not getattr(shape, 'has_text_frame', False):
+                    continue
+                # Skip shapes already repositioned by panel swap
+                if id(shape) in _panel_ids:
                     continue
                 if shape.left is None or shape.top is None or shape.width is None or shape.height is None:
                     continue
@@ -2589,32 +2761,70 @@ class SlideContentTransformer:
                         except ValueError:
                             pass
 
+                # Determine if this is a placeholder title
+                is_ph = getattr(shape, 'is_placeholder', False)
+                ph_type_str = ''
+                if is_ph:
+                    try:
+                        ph_type_str = str(
+                            shape.placeholder_format.type
+                        ).lower()
+                    except Exception:
+                        pass
+
                 text_shapes.append({
                     'shape': shape,
                     'top': int(shape.top),
                     'bottom': int(shape.top) + int(shape.height),
                     'left': int(shape.left),
                     'right': int(shape.left) + int(shape.width),
+                    'width': int(shape.width),
                     'height': int(shape.height),
                     'font_size': max_font_size,
                     'text_len': len(text),
+                    'is_placeholder': is_ph,
+                    'ph_type': ph_type_str,
                 })
             except Exception:
                 continue
 
-        # Identify title-like shapes: large font (>4000 = 40pt), in top 30% of slide
-        top_30pct = self._slide_height * 0.30
-        titles = [s for s in text_shapes
-                  if s['font_size'] >= 4000 and s['top'] < top_30pct]
+        # ── Two-tier title detection ──
+        # Tier A: Placeholder titles always qualify.
+        # Tier B: Freeform titles need stricter criteria (5-model consensus).
+        top_22pct = self._slide_height * 0.22
+
+        def _is_title_candidate(s):
+            # Tier A — placeholder titles
+            if s['is_placeholder']:
+                pt = s['ph_type']
+                if 'title' in pt and 'subtitle' not in pt:
+                    return True
+                if 'center' in pt:  # CENTER_TITLE
+                    return True
+            # Tier B — conservative freeform fallback
+            return (
+                not s['is_placeholder']
+                and s['font_size'] >= 4400       # ≥44pt (was 40pt)
+                and s['top'] < top_22pct          # top 22% (was 30%)
+                and s['text_len'] <= 80            # short text only
+                and s['height'] <= self._slide_height * 0.20
+            )
+
+        titles = [s for s in text_shapes if _is_title_candidate(s)]
 
         if not titles:
             return 0
+
+        # Track moved bodies to prevent multi-push
+        moved_body_ids = set()
 
         # For each title, check if any body-like shape overlaps vertically
         for title in titles:
             for body in text_shapes:
                 if body is title:
                     continue
+                if id(body['shape']) in moved_body_ids:
+                    continue  # Already moved this body
                 # Body must have smaller font than title
                 if body['font_size'] >= title['font_size']:
                     continue
@@ -2625,11 +2835,15 @@ class SlideContentTransformer:
                     continue  # Body is already below title — no overlap
 
                 # OVERLAP DETECTED: body['top'] is between title['top'] and title['bottom']
-                # Check if both shapes have significant horizontal overlap
+                # Require ≥30% horizontal overlap of narrower shape (5-model consensus)
                 h_overlap = (min(title['right'], body['right']) -
                            max(title['left'], body['left']))
-                if h_overlap <= 0:
-                    continue  # No horizontal overlap — texts in different columns
+                min_width = min(
+                    title['right'] - title['left'],
+                    body['right'] - body['left'],
+                )
+                if min_width <= 0 or h_overlap < min_width * 0.30:
+                    continue  # Insufficient overlap — likely adjacent columns
 
                 # Move body down to clear the title
                 new_top = title['bottom'] + GAP_EMU
@@ -2643,6 +2857,7 @@ class SlideContentTransformer:
                             off.set('y', str(new_top))
                             body['top'] = new_top
                             body['bottom'] = new_top + body['height']
+                            moved_body_ids.add(id(body['shape']))
                             changes += 1
                             logger.debug(
                                 'Fix 12 slide %d: moved body "%s" y %d -> %d to clear title',
@@ -2653,6 +2868,388 @@ class SlideContentTransformer:
                 except Exception as exc:
                     logger.debug('Fix 12: %s', exc)
 
+        return changes
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Fix 23: Post-mirror z-order normalization (placeholder pairs only)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _fix_placeholder_z_order(self, slide, slide_number: int) -> int:
+        """
+        After all mirroring / position fixes, check for picture placeholders
+        that render ON TOP of text placeholders (title/body) due to being
+        later in spTree.  If found, move the picture element BEFORE the
+        text element so text is visible.
+
+        Safety constraints (3-model consensus Round 2, 2026-03-17):
+        - Only operates on PLACEHOLDER pairs (not freeform shapes)
+        - Only reorders <p:pic> and <p:sp> elements
+        - Does not touch graphicFrame, cxnSp, or grpSp
+
+        Round 2 fix: When xfrm is absent from slide XML (positions inherited
+        from layout), fall back to python-pptx shape API which resolves the
+        full inheritance chain (slide → layout → master).
+        """
+        changes = 0
+        try:
+            spTree = slide.shapes._spTree
+            P_NS = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+
+            # Build element → shape lookup for fallback position resolution
+            shape_by_element = {}
+            try:
+                for shape in slide.shapes:
+                    shape_by_element[id(shape._element)] = shape
+            except Exception:
+                pass
+
+            # Collect placeholders with position + z-order info
+            ph_shapes = []
+            for idx, sp_el in enumerate(spTree):
+                tag = sp_el.tag
+                if not (tag.endswith('}sp') or tag.endswith('}pic')):
+                    continue
+                # Check if it's a placeholder
+                ph_el = sp_el.find(f'.//{{{P_NS}}}ph')
+                if ph_el is None:
+                    continue
+                ph_type = (ph_el.get('type') or '').lower()
+
+                # Get position — try XML xfrm first, fall back to shape API
+                l = t = w = h = None
+                try:
+                    xfrm = sp_el.find(f'.//{{{A_NS}}}xfrm')
+                    if xfrm is not None:
+                        off = xfrm.find(f'{{{A_NS}}}off')
+                        ext = xfrm.find(f'{{{A_NS}}}ext')
+                        if off is not None and ext is not None:
+                            l = int(off.get('x', 0))
+                            t = int(off.get('y', 0))
+                            w = int(ext.get('cx', 0))
+                            h = int(ext.get('cy', 0))
+                except Exception:
+                    pass
+
+                # Fallback: resolve via python-pptx shape API (handles
+                # layout/master inheritance when xfrm is absent)
+                if l is None or w is None or w <= 0 or h is None or h <= 0:
+                    try:
+                        shape_obj = shape_by_element.get(id(sp_el))
+                        if shape_obj is not None:
+                            sl = getattr(shape_obj, 'left', None)
+                            st = getattr(shape_obj, 'top', None)
+                            sw = getattr(shape_obj, 'width', None)
+                            sh = getattr(shape_obj, 'height', None)
+                            if all(v is not None for v in (sl, st, sw, sh)):
+                                l, t, w, h = int(sl), int(st), int(sw), int(sh)
+                    except Exception:
+                        pass
+
+                if l is None or t is None or w is None or h is None:
+                    continue  # Position unresolvable — skip
+                if w <= 0 or h <= 0:
+                    continue  # Invalid dimensions — skip
+
+                is_picture = tag.endswith('}pic') or ph_type == 'pic'
+                is_text = ph_type in (
+                    'title', 'ctrtitle', 'subtitle', 'body', 'obj',
+                    'dt', 'sldnum', 'ftr',  # also protect footer/date
+                )
+
+                ph_shapes.append({
+                    'element': sp_el,
+                    'is_picture': is_picture,
+                    'is_text': is_text,
+                    'left': l, 'top': t, 'width': w, 'height': h,
+                    'z_index': idx,
+                })
+
+            # Check for picture-above-text overlaps
+            reordered = set()
+            for pic in ph_shapes:
+                if not pic['is_picture']:
+                    continue
+                if id(pic['element']) in reordered:
+                    continue
+                for txt in ph_shapes:
+                    if not txt['is_text']:
+                        continue
+                    if id(txt['element']) in reordered:
+                        continue
+                    # Check overlap
+                    h_overlap = max(
+                        0,
+                        min(pic['left'] + pic['width'],
+                            txt['left'] + txt['width'])
+                        - max(pic['left'], txt['left']),
+                    )
+                    v_overlap = max(
+                        0,
+                        min(pic['top'] + pic['height'],
+                            txt['top'] + txt['height'])
+                        - max(pic['top'], txt['top']),
+                    )
+                    if h_overlap <= 0 or v_overlap <= 0:
+                        continue  # No overlap
+                    # Picture is after text in spTree → renders on top
+                    pic_idx = list(spTree).index(pic['element'])
+                    txt_idx = list(spTree).index(txt['element'])
+                    if pic_idx > txt_idx:
+                        # Move picture before text in spTree
+                        spTree.remove(pic['element'])
+                        spTree.insert(txt_idx, pic['element'])
+                        reordered.add(id(pic['element']))
+                        changes += 1
+                        logger.debug(
+                            'Fix 23 slide %d: reordered picture PH '
+                            'before text PH to prevent occlusion',
+                            slide_number,
+                        )
+                        break  # One reorder per picture
+        except Exception as exc:
+            logger.debug('Fix 23: %s', exc)
+
+        return changes
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Fix 24 (Round 2: active): Skip mirroring master/layout duplicates
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _skip_master_layout_duplicates(
+        self, slide, shapes: list, slide_number: int,
+        handled_ids: set,
+    ) -> None:
+        """Detect slide-level shapes that duplicate master/layout shapes.
+        Add them to handled_ids so they are SKIPPED during position mirroring.
+        This prevents:
+        - Duplication: slide logo mirrors to opposite side while master logo stays
+        - Occlusion: mirrored slide logo lands on top of master logo
+
+        Matching criteria (3-model consensus):
+        - Same XML element tag (pic, sp, freeform, etc.)
+        - Position within 0.5" tolerance (allows for minor layout adjustments)
+        - Size within 25% ratio tolerance
+        """
+        try:
+            TOLERANCE = 457200  # ~0.5" — wider than logging-only to catch more
+            SIZE_RATIO_MIN = 0.75  # 25% size tolerance
+            SIZE_RATIO_MAX = 1.25
+
+            # Collect master and layout shape geometries
+            layer_shapes = []
+            for layer_name, layer in [
+                ('layout', slide.slide_layout),
+                ('master', slide.slide_layout.slide_master),
+            ]:
+                try:
+                    for ms in layer.shapes:
+                        ml = getattr(ms, 'left', None)
+                        mt = getattr(ms, 'top', None)
+                        mw = getattr(ms, 'width', None)
+                        mh = getattr(ms, 'height', None)
+                        if any(v is None for v in (ml, mt, mw, mh)):
+                            continue
+                        # Only consider image/picture shapes from master/layout
+                        mtag = ms._element.tag.split('}')[-1]
+                        is_image = (mtag == 'pic'
+                                    or ms._element.find(
+                                        f'.//{{{A_NS}}}blipFill') is not None)
+                        if not is_image:
+                            continue  # Only match image/logo shapes
+                        layer_shapes.append({
+                            'layer': layer_name,
+                            'name': getattr(ms, 'name', '?'),
+                            'left': int(ml), 'top': int(mt),
+                            'width': int(mw), 'height': int(mh),
+                            'tag': mtag,
+                        })
+                except Exception:
+                    continue
+
+            if not layer_shapes:
+                return
+
+            for shape in shapes:
+                try:
+                    if getattr(shape, 'is_placeholder', False):
+                        continue
+                    if id(shape) in handled_ids:
+                        continue
+                    sl = int(shape.left) if shape.left is not None else None
+                    st = int(shape.top) if shape.top is not None else None
+                    sw = int(shape.width) if shape.width is not None else None
+                    sh = int(shape.height) if shape.height is not None else None
+                    if any(v is None for v in (sl, st, sw, sh)):
+                        continue
+                    if sw <= 0 or sh <= 0:
+                        continue
+                    # Only match image/logo shapes on the slide
+                    stag = shape._element.tag.split('}')[-1]
+                    is_image = (stag == 'pic'
+                                or shape._element.find(
+                                    f'.//{{{A_NS}}}blipFill') is not None)
+                    if not is_image:
+                        continue  # Only skip-mirror image shapes
+
+                    for ls in layer_shapes:
+                        lw = max(1, ls['width'])
+                        lh = max(1, ls['height'])
+                        w_ratio = sw / lw
+                        h_ratio = sh / lh
+                        if (abs(sl - ls['left']) < TOLERANCE
+                                and abs(st - ls['top']) < TOLERANCE
+                                and SIZE_RATIO_MIN <= w_ratio <= SIZE_RATIO_MAX
+                                and SIZE_RATIO_MIN <= h_ratio <= SIZE_RATIO_MAX):
+                            handled_ids.add(id(shape))
+                            logger.info(
+                                'Fix 24 slide %d: skip-mirror "%s" — '
+                                'duplicates %s shape "%s"',
+                                slide_number,
+                                getattr(shape, 'name', '?'),
+                                ls['layer'],
+                                ls['name'],
+                            )
+                            break  # One match is enough
+                except Exception:
+                    continue
+        except Exception as exc:
+            logger.debug('Fix 24: %s', exc)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Fix 25: Post-mirror text-box / master-logo overlap resolution
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _fix_text_master_logo_overlap(
+        self, slide, all_shapes: list, slide_number: int,
+    ) -> int:
+        """Fix 25: After mirroring, a slide-level text box that was originally
+        far from the master logo may have been repositioned into the logo zone.
+        Detect this overlap and push the text box below the logo's bottom edge
+        with a small padding gap.
+        """
+        changes = 0
+        PADDING = 91440  # 0.1" gap below logo
+        try:
+            # 1. Collect master/layout image shapes (logos)
+            logo_rects = []
+            for layer in [slide.slide_layout, slide.slide_layout.slide_master]:
+                try:
+                    for ms in layer.shapes:
+                        ml = getattr(ms, 'left', None)
+                        mt = getattr(ms, 'top', None)
+                        mw = getattr(ms, 'width', None)
+                        mh = getattr(ms, 'height', None)
+                        if any(v is None for v in (ml, mt, mw, mh)):
+                            continue
+                        mtag = ms._element.tag.split('}')[-1]
+                        is_image = (
+                            mtag == 'pic'
+                            or ms._element.find(
+                                f'.//{{{A_NS}}}blipFill') is not None
+                        )
+                        if not is_image:
+                            continue
+                        # Only consider small-ish logos (< 25% of slide width)
+                        slide_width = self._slide_width or 12192000
+                        if int(mw) > slide_width * 0.25:
+                            continue
+                        logo_rects.append({
+                            'left': int(ml), 'top': int(mt),
+                            'width': int(mw), 'height': int(mh),
+                            'name': getattr(ms, 'name', '?'),
+                        })
+                except Exception:
+                    continue
+
+            if not logo_rects:
+                return 0
+
+            # 2. Check each slide-level TEXT BOX for overlap with logos
+            #    Only TextBox (type 17) — skip freeforms, auto-shapes, etc.
+            from pptx.enum.shapes import MSO_SHAPE_TYPE
+            for shape in all_shapes:
+                try:
+                    if not getattr(shape, 'has_text_frame', False):
+                        continue
+                    # Only non-placeholder text boxes (TextBox type)
+                    if getattr(shape, 'is_placeholder', False):
+                        continue
+                    if shape.shape_type != MSO_SHAPE_TYPE.TEXT_BOX:
+                        continue
+                    sx = shape.left
+                    sy = shape.top
+                    sw = shape.width
+                    sh = shape.height
+                    if any(v is None for v in (sx, sy, sw, sh)):
+                        continue
+                    sx, sy, sw, sh = int(sx), int(sy), int(sw), int(sh)
+                    if sw <= 0 or sh <= 0:
+                        continue
+
+                    for logo in logo_rects:
+                        lx = logo['left']
+                        ly = logo['top']
+                        lw = logo['width']
+                        lh = logo['height']
+
+                        # Check horizontal overlap
+                        overlap_x = min(sx + sw, lx + lw) - max(sx, lx)
+                        if overlap_x <= 0:
+                            continue
+                        # Check vertical overlap
+                        overlap_y = min(sy + sh, ly + lh) - max(sy, ly)
+                        if overlap_y <= 0:
+                            continue
+
+                        # There IS overlap — shift text box LEFT of the logo
+                        # to preserve its original y position and avoid
+                        # colliding with content below.
+                        new_x = lx - sw - PADDING  # place to left of logo
+                        if new_x < 0:
+                            # Not enough room on the left — fall back to
+                            # pushing below the logo instead.
+                            new_y = ly + lh + PADDING
+                            xfrm = shape._element.find(
+                                f'.//{{{A_NS}}}xfrm'
+                            )
+                            if xfrm is None:
+                                continue
+                            off = xfrm.find(f'{{{A_NS}}}off')
+                            if off is None:
+                                continue
+                            off.set('y', str(new_y))
+                            changes += 1
+                            logger.info(
+                                'Fix 25 slide %d: pushed "%s" below '
+                                'master logo "%s" (y %d → %d)',
+                                slide_number,
+                                getattr(shape, 'name', '?'),
+                                logo['name'], sy, new_y,
+                            )
+                        else:
+                            xfrm = shape._element.find(
+                                f'.//{{{A_NS}}}xfrm'
+                            )
+                            if xfrm is None:
+                                continue
+                            off = xfrm.find(f'{{{A_NS}}}off')
+                            if off is None:
+                                continue
+                            off.set('x', str(new_x))
+                            changes += 1
+                            logger.info(
+                                'Fix 25 slide %d: shifted "%s" left '
+                                'of master logo "%s" (x %d → %d)',
+                                slide_number,
+                                getattr(shape, 'name', '?'),
+                                logo['name'], sx, new_x,
+                            )
+                        shape._element.attrib.pop('dirty', None)
+                        break  # Only fix against first overlapping logo
+                except Exception:
+                    continue
+        except Exception as exc:
+            logger.debug('Fix 25: %s', exc)
         return changes
 
     # ─────────────────────────────────────────────────────────────────────
@@ -3013,6 +3610,169 @@ class SlideContentTransformer:
         return changes
 
     # ─────────────────────────────────────────────────────────────────────
+    # Fix 25: X-band column coherence for title/secHead layouts
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _force_xband_coherence(
+        self, shapes: list, mirrored_ids: set,
+        panel_handled_ids: set, slide_number: int,
+    ) -> int:
+        """
+        For title/secHead layouts, the per-shape gating (w>20% AND h>30%)
+        can mirror some shapes in a column while leaving shorter ones behind.
+        This creates broken layouts where half a column moves and half stays.
+
+        Fix: Group non-placeholder, non-panel-handled shapes into x-bands
+        (clusters with similar horizontal center). If ANY shape in a band
+        was individually mirrored, force-mirror all un-mirrored shapes in
+        the same band.
+
+        Thresholds (3-model consensus):
+        - X-band tolerance: ±5% of slide width (shapes belong to same column)
+        - Min shape area: 2% of slide area (skip tiny decorative dots)
+        - Skip full-width shapes (>85% slide width)
+        - Skip placeholders and panel-handled shapes
+        """
+        changes = 0
+        try:
+            XBAND_TOL = self._slide_width * 0.05
+            MIN_AREA_RATIO = 0.02
+            slide_area = self._slide_width * self._slide_height
+
+            # Collect eligible shapes with their center-x
+            eligible = []  # (shape, center_x, was_mirrored)
+            for shape in shapes:
+                try:
+                    if getattr(shape, 'is_placeholder', False):
+                        continue
+                    if id(shape) in panel_handled_ids:
+                        continue
+                    l = getattr(shape, 'left', None)
+                    w = getattr(shape, 'width', None)
+                    h = getattr(shape, 'height', None)
+                    if any(v is None for v in (l, w, h)):
+                        continue
+                    l, w, h = int(l), int(w), int(h)
+                    if w >= self._slide_width * 0.85:
+                        continue  # Full-width
+                    if w * h < slide_area * MIN_AREA_RATIO:
+                        continue  # Tiny decoration
+                    center_x = l + w // 2
+                    was_mirrored = id(shape) in mirrored_ids
+                    eligible.append((shape, center_x, was_mirrored))
+                except Exception:
+                    continue
+
+            if not eligible:
+                return 0
+
+            # Cluster into x-bands using simple greedy grouping
+            bands = []  # list of lists of (shape, center_x, was_mirrored)
+            for item in eligible:
+                _, cx, _ = item
+                placed = False
+                for band in bands:
+                    band_avg = sum(c for _, c, _ in band) / len(band)
+                    if abs(cx - band_avg) < XBAND_TOL:
+                        band.append(item)
+                        placed = True
+                        break
+                if not placed:
+                    bands.append([item])
+
+            # For each band: if any shape was mirrored, mirror the rest
+            for band in bands:
+                has_mirrored = any(m for _, _, m in band)
+                if not has_mirrored:
+                    continue  # No mirrored shapes in this band — skip
+                for shape, _, was_mirrored in band:
+                    if was_mirrored:
+                        continue  # Already mirrored
+                    try:
+                        if self._mirror_freeform_shape(shape, self._slide_width):
+                            changes += 1
+                            mirrored_ids.add(id(shape))
+                            logger.debug(
+                                'Fix 25 slide %d: x-band coherence '
+                                'force-mirrored "%s"',
+                                slide_number,
+                                getattr(shape, 'name', '?'),
+                            )
+                    except Exception:
+                        continue
+
+        except Exception as exc:
+            logger.debug('Fix 25: %s', exc)
+
+        return changes
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Post-mirror: resolve overlap from independent mirroring
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _resolve_post_mirror_text_overlaps(
+        self, shapes: list, mirrored_ids: set, slide_number: int
+    ) -> int:
+        """
+        After individual mirroring, detect pairs of mirrored shapes that
+        now overlap significantly.  If two mirrored shapes overlap by more
+        than 50% of the smaller shape's width AND are in the same vertical
+        band, swap their left positions.
+
+        This handles two-column text-only layouts where neither the anchor-
+        based nor cluster-based split-panel detectors fired (e.g. Slide 12
+        with two text boxes that should swap sides).
+        """
+        changes = 0
+        mirrored = []
+        for shape in shapes:
+            if id(shape) not in mirrored_ids:
+                continue
+            l = getattr(shape, 'left', None)
+            w = getattr(shape, 'width', None)
+            h = getattr(shape, 'height', None)
+            t = getattr(shape, 'top', None)
+            if any(v is None for v in (l, w, h, t)):
+                continue
+            mirrored.append((shape, int(l), int(w), int(h), int(t)))
+
+        already_swapped = set()
+        for i in range(len(mirrored)):
+            if i in already_swapped:
+                continue
+            for j in range(i + 1, len(mirrored)):
+                if j in already_swapped:
+                    continue
+                s1, l1, w1, h1, t1 = mirrored[i]
+                s2, l2, w2, h2, t2 = mirrored[j]
+
+                # Both must be vertically overlapping (≥30% of shorter shape)
+                v_overlap = max(0, min(t1 + h1, t2 + h2) - max(t1, t2))
+                if v_overlap < min(h1, h2) * 0.30:
+                    continue  # Not in the same vertical band
+
+                # Check horizontal overlap (≥50% of narrower shape)
+                h_overlap = max(0, min(l1 + w1, l2 + w2) - max(l1, l2))
+                if h_overlap <= min(w1, w2) * 0.50:
+                    continue  # Not significantly overlapping
+
+                # Swap their left positions
+                s1.left = l2
+                s2.left = l1
+                changes += 2
+                already_swapped.add(i)
+                already_swapped.add(j)
+                logger.debug(
+                    'Slide %d: resolved post-mirror overlap — '
+                    'swapped "%s" (L=%d) and "%s" (L=%d)',
+                    slide_number,
+                    getattr(s1, 'name', '?'), l1,
+                    getattr(s2, 'name', '?'), l2,
+                )
+
+        return changes
+
+    # ─────────────────────────────────────────────────────────────────────
     # Pre-mirror: Split-panel swap BEFORE individual mirroring
     # ─────────────────────────────────────────────────────────────────────
 
@@ -3020,12 +3780,18 @@ class SlideContentTransformer:
         self, shapes: list, slide_number: int, handled_ids: set
     ) -> int:
         """
-        Detect split-panel layouts (image on one side, content on other)
-        BEFORE individual shape mirroring. If detected, swap ALL shapes
-        in each panel as a unit, preserving internal spatial relationships.
+        Detect split-panel layouts BEFORE individual shape mirroring.
+        If detected, swap ALL shapes in each panel as a unit.
 
-        This replaces the old post-mirror _mirror_split_panel_layout approach
-        which scrambled positions before detection could run.
+        Detection strategy (cascading):
+        1. Anchor-based (original): large shape (>35% W, >50% H) on each side,
+           one image + one non-image.  Handles classic "big photo | text block".
+        2. Cluster-based (fallback): no single anchor on one or both sides, but
+           shapes cluster into two spatially distinct groups on opposite sides
+           of the slide midpoint with a clear horizontal gap, and at least one
+           side contains an image.  Handles "big photo | many small text boxes".
+
+        Shapes that are full-width (>85% slide) or placeholders are excluded.
 
         Args:
             shapes: all shapes on the slide
@@ -3039,63 +3805,21 @@ class SlideContentTransformer:
         try:
             half_width = self._slide_width // 2
 
-            # Step 1: Find large panel-defining shapes (>35% width, >50% height)
-            left_anchor = None  # large shape in left half
-            right_anchor = None  # large shape in right half
-
-            for shape in shapes:
-                try:
-                    w = getattr(shape, 'width', None)
-                    h = getattr(shape, 'height', None)
-                    l = getattr(shape, 'left', None)
-                    if any(v is None for v in (w, h, l)):
-                        continue
-                    w, h, l = int(w), int(h), int(l)
-                    if w < self._slide_width * 0.35 or h < self._slide_height * 0.50:
-                        continue
-                    center_x = l + w // 2
-                    if center_x < half_width:
-                        if left_anchor is None or int(left_anchor.width) < w:
-                            left_anchor = shape
-                    else:
-                        if right_anchor is None or int(right_anchor.width) < w:
-                            right_anchor = shape
-                except Exception:
-                    continue
-
-            # Need exactly one anchor on each side
-            if left_anchor is None or right_anchor is None:
-                return 0
-
-            # Check that one is an image and one is not
-            def _is_image_shape(s):
-                tag = s._element.tag
-                if tag.endswith('}pic'):
-                    return True
-                return s._element.find(f'.//{{{A_NS}}}blipFill') is not None
-
-            left_is_img = _is_image_shape(left_anchor)
-            right_is_img = _is_image_shape(right_anchor)
-            if left_is_img == right_is_img:
-                return 0  # Both images or both non-images — not a split panel
-
-            # Step 2: Classify ALL shapes into left-panel vs right-panel
-            left_shapes = []  # shapes whose center is in left half
-            right_shapes = []  # shapes whose center is in right half
-            full_width_shapes = []  # shapes spanning >85% slide width
+            # ── Step 1: Classify non-placeholder shapes into left/right ──
+            left_shapes = []
+            right_shapes = []
 
             for shape in shapes:
                 try:
                     if getattr(shape, 'is_placeholder', False):
-                        continue  # Placeholders handled separately
+                        continue
                     l = getattr(shape, 'left', None)
                     w = getattr(shape, 'width', None)
                     if l is None or w is None:
                         continue
                     l, w = int(l), int(w)
                     if w >= self._slide_width * 0.85:
-                        full_width_shapes.append(shape)
-                        continue
+                        continue  # Full-width — not part of any panel
                     center_x = l + w // 2
                     if center_x < half_width:
                         left_shapes.append(shape)
@@ -3107,38 +3831,165 @@ class SlideContentTransformer:
             if not left_shapes or not right_shapes:
                 return 0
 
-            # Step 3: Compute panel bounding boxes
-            def _bbox(shape_list):
-                min_x = min(int(s.left) for s in shape_list)
-                max_r = max(int(s.left) + int(s.width) for s in shape_list)
-                return min_x, max_r
+            def _is_image_shape(s):
+                tag = s._element.tag
+                if tag.endswith('}pic'):
+                    return True
+                return s._element.find(f'.//{{{A_NS}}}blipFill') is not None
 
-            left_min_x, left_max_x = _bbox(left_shapes)
-            right_min_x, right_max_x = _bbox(right_shapes)
+            def _is_panel_image(s):
+                """Size-weighted image check: only large images qualify as panel anchors.
+                Filters out logos, icons, watermarks that would cause false
+                symmetry in the asymmetric/cluster detection paths.
+                Thresholds derived from 5-model consensus review (2026-03-17).
+                """
+                if not _is_image_shape(s):
+                    return False
+                w = int(s.width) if s.width is not None else 0
+                h = int(s.height) if s.height is not None else 0
+                sw, sh = self._slide_width, self._slide_height
+                if sw == 0 or sh == 0:
+                    return False
+                wr = w / sw
+                hr = h / sh
+                ar = (w * h) / (sw * sh)
+                # (W>25% AND H>50%) OR area>20% OR W>40% (landscape override)
+                return (wr > 0.25 and hr > 0.50) or ar > 0.20 or wr > 0.40
 
-            # Step 4: Swap panels — shift all left shapes to the right zone
-            # and all right shapes to the left zone
-            # Delta = how far to shift each panel
-            # Left panel moves right by: right_min_x - left_min_x
-            # Right panel moves left by: left_min_x - right_min_x
-            shift = right_min_x - left_min_x
+            def _side_has_image(shape_list):
+                return any(_is_image_shape(s) for s in shape_list)
 
-            for shape in left_shapes:
+            def _side_has_panel_image(shape_list):
+                return any(_is_panel_image(s) for s in shape_list)
+
+            # ── Step 2: Try anchor-based detection (original logic) ──
+            # Threshold lowered from 0.35 to 0.30 to handle Google Slides
+            # format (10" wide) where a ~3.3" panel is 33% of slide width.
+            left_anchor = None
+            right_anchor = None
+
+            for shape in shapes:
                 try:
-                    old_left = int(shape.left)
-                    new_left = old_left + shift
-                    new_left = max(0, min(new_left, self._slide_width - int(shape.width)))
-                    shape.left = new_left
-                    handled_ids.add(id(shape))
-                    changes += 1
+                    w = getattr(shape, 'width', None)
+                    h = getattr(shape, 'height', None)
+                    l = getattr(shape, 'left', None)
+                    if any(v is None for v in (w, h, l)):
+                        continue
+                    w, h, l = int(w), int(h), int(l)
+                    if w < self._slide_width * 0.30 or h < self._slide_height * 0.50:
+                        continue
+                    center_x = l + w // 2
+                    if center_x < half_width:
+                        if left_anchor is None or int(left_anchor.width) < w:
+                            left_anchor = shape
+                    else:
+                        if right_anchor is None or int(right_anchor.width) < w:
+                            right_anchor = shape
                 except Exception:
                     continue
 
-            for shape in right_shapes:
+            anchor_detected = False
+            if left_anchor is not None and right_anchor is not None:
+                if _is_image_shape(left_anchor) != _is_image_shape(right_anchor):
+                    anchor_detected = True
+
+            # ── Step 3a: Asymmetric anchor detection ──
+            # When ONE side has a large image anchor and the other side has
+            # multiple non-image shapes, this is the classic "big photo | text
+            # cluster" layout.  Swap without requiring a gap — the text boxes
+            # may interleave past the midpoint but they clearly belong to the
+            # opposite panel.
+            asymmetric_detected = False
+            if not anchor_detected:
+                # Use size-weighted panel check: small logos/icons don't
+                # count as "panel images" for asymmetry detection.
+                left_has_panel = _side_has_panel_image(left_shapes)
+                right_has_panel = _side_has_panel_image(right_shapes)
+
+                # Exactly one anchor exists and it is an image
+                if (left_anchor is not None) != (right_anchor is not None):
+                    anchor = left_anchor if left_anchor is not None else right_anchor
+                    if _is_image_shape(anchor):
+                        # The non-anchor side must have >=2 shapes and no
+                        # panel-sized images (small logos are OK).
+                        if anchor is left_anchor:
+                            other_side = right_shapes
+                            other_has_panel = right_has_panel
+                        else:
+                            other_side = left_shapes
+                            other_has_panel = left_has_panel
+                        if len(other_side) >= 2 and not other_has_panel:
+                            asymmetric_detected = True
+                            logger.debug(
+                                'Slide %d: asymmetric anchor detected — '
+                                'image anchor on %s, %d text shapes on %s',
+                                slide_number,
+                                'left' if anchor is left_anchor else 'right',
+                                len(other_side),
+                                'right' if anchor is left_anchor else 'left',
+                            )
+
+            # ── Step 3b: Cluster-based fallback ──
+            cluster_detected = False
+            if not anchor_detected and not asymmetric_detected:
+                def _cluster_bbox(shape_list):
+                    if not shape_list:
+                        return 0, 0, 0, 0
+                    min_x = min(int(s.left) for s in shape_list)
+                    max_r = max(int(s.left) + int(s.width) for s in shape_list)
+                    vals_y = []
+                    for s in shape_list:
+                        t = getattr(s, 'top', None)
+                        h = getattr(s, 'height', None)
+                        if t is not None and h is not None:
+                            vals_y.append((int(t), int(t) + int(h)))
+                    if not vals_y:
+                        return min_x, max_r, 0, 0
+                    min_y = min(v[0] for v in vals_y)
+                    max_y = max(v[1] for v in vals_y)
+                    return min_x, max_r, min_y, max_y
+
+                l_x1, l_x2, l_y1, l_y2 = _cluster_bbox(left_shapes)
+                r_x1, r_x2, r_y1, r_y2 = _cluster_bbox(right_shapes)
+
+                l_w = l_x2 - l_x1
+                l_h = l_y2 - l_y1
+                r_w = r_x2 - r_x1
+                r_h = r_y2 - r_y1
+
+                # Relaxed thresholds for cluster bounding boxes
+                MIN_CLUSTER_W = self._slide_width * 0.25
+                MIN_CLUSTER_H = self._slide_height * 0.30
+
+                left_qualifies = (l_w >= MIN_CLUSTER_W and l_h >= MIN_CLUSTER_H)
+                right_qualifies = (r_w >= MIN_CLUSTER_W and r_h >= MIN_CLUSTER_H)
+
+                # Ensure clear horizontal gap between panels (>5% slide width)
+                gap = r_x1 - l_x2
+                MIN_GAP = self._slide_width * 0.05
+
+                if ((left_qualifies or right_qualifies)
+                        and gap >= MIN_GAP
+                        and (len(left_shapes) >= 2 or len(right_shapes) >= 2)):
+                    # Require panel-image asymmetry (size-weighted)
+                    if left_has_panel != right_has_panel:
+                        cluster_detected = True
+
+            if not anchor_detected and not asymmetric_detected and not cluster_detected:
+                return 0
+
+            # ── Step 4: Mirror all panel shapes across the slide centerline ──
+            # Formula: new_left = slide_width - left - width
+            # This correctly mirrors each shape's position.  Since these shapes
+            # are added to handled_ids, the per-shape mirroring loop will skip
+            # them (no double-mirror).
+            all_panel_shapes = left_shapes + right_shapes
+            for shape in all_panel_shapes:
                 try:
                     old_left = int(shape.left)
-                    new_left = old_left - shift
-                    new_left = max(0, min(new_left, self._slide_width - int(shape.width)))
+                    w = int(shape.width)
+                    new_left = self._slide_width - old_left - w
+                    new_left = max(0, min(new_left, self._slide_width - w))
                     shape.left = new_left
                     handled_ids.add(id(shape))
                     changes += 1
@@ -3146,11 +3997,12 @@ class SlideContentTransformer:
                     continue
 
             if changes > 0:
+                method = ('anchor' if anchor_detected
+                          else 'asymmetric' if asymmetric_detected
+                          else 'cluster')
                 logger.debug(
-                    'Pre-mirror panel swap slide %d: %d left shapes shifted +%d, '
-                    '%d right shapes shifted -%d',
-                    slide_number, len(left_shapes), shift,
-                    len(right_shapes), shift
+                    'Pre-mirror panel swap slide %d (%s): mirrored %d shapes',
+                    slide_number, method, changes,
                 )
 
         except Exception as exc:

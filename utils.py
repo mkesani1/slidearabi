@@ -336,8 +336,15 @@ def get_placeholder_info(shape) -> Optional[Tuple[str, int]]:
         ph_fmt = shape.placeholder_format
         if ph_fmt is None:
             return None
-        # PP_PLACEHOLDER enum → string name
-        ph_type = str(ph_fmt.type).split('.')[-1].lower()
+        # PP_PLACEHOLDER enum → canonical string name.
+        # str(enum) can return 'SLIDE_NUMBER (13)' — strip the ' (N)' suffix.
+        raw = str(ph_fmt.type).split('.')[-1].lower().strip()
+        # Remove trailing ' (digits)' or ' (-digits)'
+        paren_idx = raw.rfind(' (')
+        if paren_idx > 0 and raw.endswith(')'):
+            ph_type = raw[:paren_idx]
+        else:
+            ph_type = raw
         ph_idx = ph_fmt.idx if ph_fmt.idx is not None else 0
         return ph_type, ph_idx
     except Exception:

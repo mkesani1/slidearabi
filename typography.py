@@ -132,12 +132,19 @@ MIN_CHART_FONT_SIZE_PT: float = 7.0
 # Maximum font size reduction percentage (20% of original)
 MAX_FONT_REDUCTION_PCT: float = 20.0
 
-# Text frame insets for Arabic text (in EMU: ~0.03" left/right, ~0.05" top/bottom)
-# These provide slightly more breathing room for Arabic glyphs which can be taller
-ARABIC_INSET_LEFT_EMU:   int = 27432   # ~0.03"
-ARABIC_INSET_RIGHT_EMU:  int = 27432   # ~0.03"
-ARABIC_INSET_TOP_EMU:    int = 45720   # ~0.05"
-ARABIC_INSET_BOTTOM_EMU: int = 45720   # ~0.05"
+# Minimum text frame insets for Arabic text (FLOOR values — originals preserved
+# when larger).  PowerPoint's built-in default is 91440 EMU (0.1") for left/right
+# and 45720 EMU (0.05") for top/bottom.  We use those as floors so that designer-
+# set generous margins are never crushed, while shapes with zero or tiny margins
+# still get Arabic-appropriate breathing room.
+ARABIC_MIN_INSET_LR_EMU:  int = 91440   # 0.1" — PowerPoint default left/right
+ARABIC_MIN_INSET_TOP_EMU: int = 45720   # 0.05" — PowerPoint default top
+ARABIC_MIN_INSET_BOT_EMU: int = 45720   # 0.05" — PowerPoint default bottom
+
+# PowerPoint OOXML spec defaults when bodyPr inset attributes are absent
+# (§21.1.2.1.3: lIns=91440, rIns=91440, tIns=45720, bIns=45720)
+_PPTX_DEFAULT_INSET_LR: int = 91440
+_PPTX_DEFAULT_INSET_TB: int = 45720
 
 # Average character width in points (heuristic for overflow estimation)
 # Latin characters average ~0.55× font-size in width; Arabic ~0.65× font-size
@@ -468,7 +475,7 @@ class TypographyNormalizer:
             estimated_height_pt = total_lines_estimate * line_height_pt
 
             # Apply inset margins
-            margin_pt = (ARABIC_INSET_TOP_EMU + ARABIC_INSET_BOTTOM_EMU) / 12700
+            margin_pt = (ARABIC_MIN_INSET_TOP_EMU + ARABIC_MIN_INSET_BOT_EMU) / 12700
             available_height_pt = frame_height_pt - margin_pt
 
             return estimated_height_pt > available_height_pt * 1.05  # 5% tolerance
@@ -619,25 +626,19 @@ class TypographyNormalizer:
 
     def _set_text_frame_margins(self, shape) -> int:
         """
-        Set Arabic-appropriate text frame inset margins.
+        Ensure Arabic text frames have adequate inset margins.
 
-        Arabic text needs slightly more left/right padding for visual balance
-        and slightly more top/bottom padding because Arabic characters have
-        taller ascenders and descenders than Latin equivalents.
+        Strategy: MAX(original_margin, arabic_minimum_floor).
+        - If the shape already has generous margins, preserve them.
+        - If the shape has tiny or zero margins, bump to the floor.
+        - If the shape has no explicit margin attributes, PowerPoint
+          uses implicit defaults (91440 LR, 45720 TB) — we read those
+          as the original value rather than treating absent as zero.
 
-        Sets:
-        - lIns (left inset)  ≈ 0.03"
-        - rIns (right inset) ≈ 0.03"
-        - tIns (top inset)   ≈ 0.05"
-        - bIns (bottom inset)≈ 0.05"
-
-        Only applies if the text frame contains Arabic text.
-
-        Args:
-            shape: python-pptx Shape with a text frame.
+        Only applies to shapes whose text frame contains Arabic text.
 
         Returns:
-            1 if margins were set, 0 otherwise.
+            1 if any margin was changed, 0 otherwise.
         """
         try:
             tf = shape.text_frame
@@ -649,11 +650,36 @@ class TypographyNormalizer:
             if body_pr is None:
                 return 0
 
-            body_pr.set('lIns', str(ARABIC_INSET_LEFT_EMU))
-            body_pr.set('rIns', str(ARABIC_INSET_RIGHT_EMU))
-            body_pr.set('tIns', str(ARABIC_INSET_TOP_EMU))
-            body_pr.set('bIns', str(ARABIC_INSET_BOTTOM_EMU))
-            return 1
+            changed = False
+
+            # For each axis, read the existing value (or PowerPoint implicit
+            # default if the attribute is absent), then apply MAX with floor.
+            for attr, spec_default, floor_emu in (
+                ('lIns', _PPTX_DEFAULT_INSET_LR, ARABIC_MIN_INSET_LR_EMU),
+                ('rIns', _PPTX_DEFAULT_INSET_LR, ARABIC_MIN_INSET_LR_EMU),
+                ('tIns', _PPTX_DEFAULT_INSET_TB, ARABIC_MIN_INSET_TOP_EMU),
+                ('bIns', _PPTX_DEFAULT_INSET_TB, ARABIC_MIN_INSET_BOT_EMU),
+            ):
+                raw = body_pr.get(attr)
+                if raw is not None:
+                    try:
+                        original = int(raw)
+                    except (ValueError, TypeError):
+                        original = spec_default
+                else:
+                    # Attribute absent → PowerPoint uses its spec default
+                    original = spec_default
+
+                target = max(original, floor_emu)
+                # Only write if we're actually changing the effective value
+                if raw is None and target != spec_default:
+                    body_pr.set(attr, str(target))
+                    changed = True
+                elif raw is not None and int(raw) != target:
+                    body_pr.set(attr, str(target))
+                    changed = True
+
+            return 1 if changed else 0
 
         except Exception as exc:
             logger.debug('_set_text_frame_margins on "%s": %s',
