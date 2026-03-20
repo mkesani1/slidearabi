@@ -64,11 +64,21 @@ import queue as _queue_mod
 PENDING_QUEUE: _queue_mod.Queue = _queue_mod.Queue(maxsize=10)
 
 def _queue_dispatcher() -> None:
-    """Background thread that drains the pending queue sequentially."""
+    """Background thread that drains the pending queue sequentially.
+    
+    Uses a BLOCKING semaphore acquire so queued jobs wait their turn
+    instead of failing with 'Pipeline busy'.
+    """
     while True:
         job_id = PENDING_QUEUE.get()  # blocks until a job appears
         try:
-            _run_pipeline_worker(job_id)
+            # Block until the pipeline is free — this is the whole point
+            # of the queue. Jobs wait here, not fail.
+            PIPELINE_SEMAPHORE.acquire(blocking=True)
+            try:
+                _run_pipeline_worker_inner(job_id)
+            finally:
+                PIPELINE_SEMAPHORE.release()
         except Exception as exc:
             logger.exception("Queue dispatcher failed for %s: %s", job_id, exc)
         finally:
@@ -522,17 +532,37 @@ def _write_preview_debug(
 
 
 def _run_pipeline_worker(job_id: str) -> None:
+    """Direct-start path: acquire semaphore non-blocking, run if free.
+    If busy, the caller should enqueue instead — never fail with 'busy'.
+    """
     acquired = PIPELINE_SEMAPHORE.acquire(blocking=False)
     if not acquired:
-        _set_job_state(
-            job_id,
-            status="failed",
-            error="Pipeline busy. Please retry later.",
-            progress_pct=0,
-        )
-        logger.warning("Semaphore unavailable for job %s", job_id)
+        # Don't fail — enqueue for the dispatcher to process
+        try:
+            PENDING_QUEUE.put_nowait(job_id)
+            logger.info("Job %s re-queued from worker (semaphore busy, queue depth: %d)",
+                       job_id, PENDING_QUEUE.qsize())
+        except _queue_mod.Full:
+            _set_job_state(
+                job_id,
+                status="failed",
+                error="Server overloaded. Please retry in a minute.",
+                progress_pct=0,
+            )
+            logger.error("Queue full, job %s rejected", job_id)
         return
 
+    try:
+        _run_pipeline_worker_inner(job_id)
+    finally:
+        PIPELINE_SEMAPHORE.release()
+        # After releasing, kick the next queued job if any
+        if not PENDING_QUEUE.empty():
+            logger.info("Semaphore released, queue has %d pending", PENDING_QUEUE.qsize())
+
+
+def _run_pipeline_worker_inner(job_id: str) -> None:
+    """Core pipeline execution — assumes semaphore is already held."""
     try:
         with JOBS_LOCK:
             job = JOBS.get(job_id)
@@ -664,8 +694,8 @@ def _run_pipeline_worker(job_id: str) -> None:
             status="failed",
             error=str(exc),
         )
-    finally:
-        PIPELINE_SEMAPHORE.release()
+    # Note: semaphore release is handled by the CALLER
+    # (_run_pipeline_worker or _queue_dispatcher), not here.
 
 
 def _start_pipeline_if_allowed(job_id: str) -> None:
