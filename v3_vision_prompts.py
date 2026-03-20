@@ -177,8 +177,11 @@ def select_slides_for_vision(
         remaining = max_slides - len(selected)
         selected.extend(sorted(tier3_slides)[:remaining])
 
-    logger.info(f"Selective vision: {len(selected)} slides selected "
+    # Never cap tier1 slides — CRITICAL/HIGH always get vision QA
+    final = sorted(set(selected))
+
+    logger.info(f"Selective vision: {len(final)} slides selected "
                 f"(tier1={len(tier1_slides)}, tier2={len(tier2_slides)}, "
                 f"tier3={len(tier3_slides)}, cap={max_slides})")
 
-    return sorted(set(selected))[:max_slides]
+    return final

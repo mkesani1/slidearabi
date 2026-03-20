@@ -290,8 +290,11 @@ class TestCheckDirectionalSymbolOrientation:
 
     def test_directional_presets_coverage(self):
         """All expected directional presets are in DIRECTIONAL_PRESETS."""
-        expected = {'rightArrow', 'chevron', 'homePlate', 'notchedRightArrow'}
+        expected = {'rightArrow', 'chevron', 'homePlate', 'notchedRightArrow', 'rtTriangle'}
         assert expected.issubset(V3XMLChecker.DIRECTIONAL_PRESETS)
+        # Verify invalid names are NOT present
+        assert 'rightTriangle' not in V3XMLChecker.DIRECTIONAL_PRESETS
+        assert 'swooshArrow' not in V3XMLChecker.DIRECTIONAL_PRESETS
 
 
 # ─────────────────────────────────────────────────────────────────────────────

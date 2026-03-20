@@ -652,7 +652,7 @@ class V3XMLChecker:
     # Preset geometry types for circular shapes
     CIRCULAR_PRESETS = frozenset([
         'ellipse', 'pie', 'donut', 'arc', 'blockArc',
-        'flowChartConnector', 'flowChartPunchedTape',
+        'flowChartConnector',  # circle connector in flowcharts
         'actionButtonBlank',  # often used as circle buttons
     ])
 
@@ -661,8 +661,8 @@ class V3XMLChecker:
         'rightArrow', 'stripedRightArrow', 'notchedRightArrow',
         'bentArrow', 'uturnArrow', 'curvedRightArrow',
         'chevron', 'homePlate', 'rightArrowCallout',
-        'circularArrow', 'swooshArrow',
-        'rightTriangle',
+        'circularArrow',
+        'rtTriangle',  # OOXML name for right triangle
     ])
 
     # ── Check #7: Text Centering in Circular/Venn Shapes (MEDIUM) ──
@@ -795,6 +795,17 @@ class V3XMLChecker:
             cNvPr = nvSpPr.find(f'{{{P_NS}}}cNvPr')
             if cNvPr is None:
                 continue
+
+            # Guard: verify shape names match between orig and conv
+            # (prevents mispairing if shapes were added/removed)
+            orig_nvSpPr = orig_sp.find(f'{{{P_NS}}}nvSpPr')
+            if orig_nvSpPr is not None:
+                orig_cNvPr = orig_nvSpPr.find(f'{{{P_NS}}}cNvPr')
+                if orig_cNvPr is not None:
+                    orig_name = (orig_cNvPr.get('name', '') or '').lower()
+                    conv_name_check = (cNvPr.get('name', '') or '').lower()
+                    if orig_name != conv_name_check:
+                        continue  # Shape ordering diverged, skip
 
             name = (cNvPr.get('name', '') or '').lower()
 

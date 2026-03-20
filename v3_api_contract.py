@@ -70,7 +70,7 @@ def _resolve_status(
         if gate_status in ('completed', 'completed_with_warnings',
                           'failed_qa', 'vqa_error'):
             return gate_status
-        return 'completed'
+        return 'vqa_error'  # Unknown gate status → treat as VQA error
 
     # Still processing
     return 'processing'
