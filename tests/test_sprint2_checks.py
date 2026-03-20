@@ -98,9 +98,18 @@ def _make_page_number_shape(x: int, y: int, num_fields: int = 1,
         t.text = '1'
 
     if doubled_text:
-        # Replace field text with doubled pattern
-        for fld in p.iter(f'{{{A_NS}}}fld'):
-            p.remove(fld)
+        # Add a slidenum field (to pass field-presence guard) then add doubled text run
+        # This simulates the real scenario where a field renders doubled text
+        if num_fields == 0:
+            fld = etree.SubElement(p, f'{{{A_NS}}}fld')
+            fld.set('type', 'slidenum')
+            fld.set('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id', 'rId1')
+            t = etree.SubElement(fld, f'{{{A_NS}}}t')
+            t.text = ''
+        # Clear existing field text and add doubled text as a run
+        for fld in list(p.iter(f'{{{A_NS}}}fld')):
+            for t_elem in fld.iter(f'{{{A_NS}}}t'):
+                t_elem.text = ''
         r = etree.SubElement(p, f'{{{A_NS}}}r')
         t = etree.SubElement(r, f'{{{A_NS}}}t')
         t.text = doubled_text

@@ -76,6 +76,25 @@ def _get_tbl_pr(tbl):
     return tbl.find(f'{{{A_NS}}}tblPr')
 
 
+def _enumerate_slide_pics(element) -> list:
+    """Enumerate all pic elements on a slide with deduplication.
+    
+    Shared between checks and fixes to ensure consistent indexing.
+    Collects <p:pic> elements first, then adds any <a:blipFill> parents
+    that aren't already in the set (prevents double-counting).
+    """
+    pics_set = set()
+    pics = []
+    for pic in element.findall(f'.//{{{P_NS}}}pic'):
+        pics_set.add(id(pic))
+        pics.append(pic)
+    for parent in element.findall(f'.//{{{A_NS}}}blipFill/..'):
+        if id(parent) not in pics_set:
+            pics_set.add(id(parent))
+            pics.append(parent)
+    return pics
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # V3 XML CHECKS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -371,22 +390,9 @@ class V3XMLChecker:
         from vqa_types import V3Defect, Severity
 
         defects = []
-        # Find pic elements (deduplicated — blipFill parents may overlap with p:pic)
-        orig_pics_set = set()
-        for pic in orig_element.findall(f'.//{{{P_NS}}}pic'):
-            orig_pics_set.add(id(pic))
-        orig_pics = list(orig_element.findall(f'.//{{{P_NS}}}pic'))
-        for parent in orig_element.findall(f'.//{{{A_NS}}}blipFill/..'):
-            if id(parent) not in orig_pics_set:
-                orig_pics.append(parent)
-
-        conv_pics_set = set()
-        for pic in conv_element.findall(f'.//{{{P_NS}}}pic'):
-            conv_pics_set.add(id(pic))
-        conv_pics = list(conv_element.findall(f'.//{{{P_NS}}}pic'))
-        for parent in conv_element.findall(f'.//{{{A_NS}}}blipFill/..'):
-            if id(parent) not in conv_pics_set:
-                conv_pics.append(parent)
+        # Find pic elements (deduplicated via shared helper)
+        orig_pics = _enumerate_slide_pics(orig_element)
+        conv_pics = _enumerate_slide_pics(conv_element)
 
         if not orig_pics or not conv_pics:
             return defects
@@ -480,6 +486,15 @@ class V3XMLChecker:
                     break  # One defect per shape
 
                 # Check for doubled-string pattern in text runs
+                # Only check shapes that contain at least one slidenum field
+                # (avoids false positives on e.g. "1010" as static content)
+                has_any_field = any(
+                    'slidenum' in (f.get('type', '') or '').lower()
+                    for f in sp.iter(f'{{{A_NS}}}fld')
+                )
+                if not has_any_field:
+                    continue
+
                 all_text = ''.join(
                     t.text or ''
                     for t in para.iter(f'{{{A_NS}}}t')
@@ -1147,8 +1162,7 @@ class V3AutoFixer:
 
     def _fix_reposition_icon(self, slide_element, defect) -> bool:
         """Move icon/image to its expected mirrored x-position."""
-        pics = slide_element.findall(f'.//{{{P_NS}}}pic') or []
-        pics.extend(slide_element.findall(f'.//{{{A_NS}}}blipFill/..'))
+        pics = _enumerate_slide_pics(slide_element)
 
         try:
             pic_idx = int(defect.object_id)
@@ -1573,7 +1587,7 @@ def compute_gate_decision(
         gate.status = "failed_qa"
     elif len(high) >= HIGH_SEVERITY_THRESHOLD:
         high_slides = len(set(d.slide_idx for d in high))
-        if total_slides > 0 and high_slides / total_slides >= HIGH_SLIDE_RATIO_THRESHOLD:
+        if total_slides > 0 and (high_slides / total_slides) >= HIGH_SLIDE_RATIO_THRESHOLD:
             gate.status = "failed_qa"
         else:
             gate.status = "completed_with_warnings"
