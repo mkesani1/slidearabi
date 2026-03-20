@@ -140,12 +140,10 @@ _CODE_TO_CATEGORY = {
     "TABLE_COLUMN_ORDER_AMBIGUOUS": "table",
     "TABLE_CELL_RTL_MISSING": "alignment",
     "TABLE_CELL_ALIGN_NOT_RIGHT": "alignment",
-    "TABLE_GARBLED_LAYOUT": "table",
     "TABLE_GRID_STRUCTURAL_ERROR": "table",
     "TABLE_GRIDCOL_NOT_REVERSED": "table",
     "TABLE_MERGED_CELL_INTEGRITY": "table",
     "ICON_IN_WRONG_TABLE_CELL": "icon",
-    "ICON_MISSING_IN_CONVERTED": "icon",
     "PAGE_NUMBER_DUPLICATED": "numbering",
     "PAGE_NUMBER_DOUBLED_STRING": "numbering",
     "SHAPE_NOT_MIRRORED_POSITION": "mirroring",
@@ -165,7 +163,6 @@ MUST_NOT_SHIP_CODES = frozenset(
     {
         "TABLE_COLUMNS_NOT_REVERSED",
         "TABLE_GRID_STRUCTURAL_ERROR",
-        "TABLE_GARBLED_LAYOUT",
     }
 )
 

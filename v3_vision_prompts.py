@@ -128,10 +128,10 @@ def select_slides_for_vision(
     """Determine which slides need vision QA based on XML findings.
     
     Strategy:
-    - Slides with CRITICAL/HIGH unresolved defects → always vision
-    - Slides with no defects at all → skip vision (XML says clean)
+    - Slides with CRITICAL/HIGH unresolved defects → always vision (never capped)
     - Slides with MEDIUM defects → vision if within budget
-    - Respect max_vision_slides cost cap
+    - Slides with no XML defects → vision only if budget remains after tiers 1+2
+    - Respect max_vision_slides cost cap (except tier1 — CRITICAL/HIGH always scanned)
     
     Returns: list of 1-based slide indices to scan with vision.
     """

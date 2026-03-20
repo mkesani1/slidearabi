@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+from collections import Counter
 from copy import deepcopy
 from dataclasses import field
 from pathlib import Path
@@ -143,8 +144,10 @@ class V3XMLChecker:
         defects.extend(self._check_circular_text_centering(slide_num, conv_slide_element))
         defects.extend(self._check_directional_symbol_orientation(slide_num, conv_slide_element))
         if orig_slide_element is not None:
-            defects.extend(self._check_master_element_mirroring(
-                slide_num, orig_slide_element, conv_slide_element))
+            import v3_config
+            if v3_config.ENABLE_MASTER_MIRROR_FIX:
+                defects.extend(self._check_master_element_mirroring(
+                    slide_num, orig_slide_element, conv_slide_element))
 
         return defects
 
@@ -159,6 +162,10 @@ class V3XMLChecker:
         defects = []
         orig_tables = _find_tables(orig_element)
         conv_tables = _find_tables(conv_element)
+
+        if len(orig_tables) != len(conv_tables):
+            logger.warning(f"Slide {slide_num}: table count mismatch "
+                          f"(orig={len(orig_tables)}, conv={len(conv_tables)})")
 
         for tbl_idx, (orig_tbl, conv_tbl) in enumerate(
             zip(orig_tables, conv_tables)
@@ -396,6 +403,10 @@ class V3XMLChecker:
 
         if not orig_pics or not conv_pics:
             return defects
+
+        if len(orig_pics) != len(conv_pics):
+            logger.warning(f"Slide {slide_num}: pic count mismatch "
+                          f"(orig={len(orig_pics)}, conv={len(conv_pics)})")
 
         # For each image, check if its x-position has been mirrored
         for pic_idx, (orig_pic, conv_pic) in enumerate(zip(orig_pics, conv_pics)):
@@ -1463,6 +1474,10 @@ def run_v3_xml_checks(
                 f"{metadata['fixable_count']} fixable) "
                 f"across {metadata['slides_checked']} slides")
 
+    if all_defects:
+        code_counts = Counter(d.code for d in all_defects)
+        logger.info(f"V3 defect breakdown: {dict(code_counts)}")
+
     return all_defects, metadata
 
 
@@ -1543,7 +1558,10 @@ def safe_apply_fixes(
                 pass
         except Exception as e:
             logger.error(f"PPTX validation failed after fixes, rolling back: {e}")
-            shutil.copy2(backup_path, pptx_path)
+            try:
+                shutil.copy2(backup_path, pptx_path)
+            except Exception as rollback_err:
+                logger.critical(f"ROLLBACK FAILED — PPTX may be corrupt: {rollback_err}")
             # Mark all as failed
             for d in applied:
                 d.status = DefectStatus.UNRESOLVED
@@ -1552,7 +1570,10 @@ def safe_apply_fixes(
 
     except Exception as e:
         logger.error(f"Fix application failed, rolling back: {e}")
-        shutil.copy2(backup_path, pptx_path)
+        try:
+            shutil.copy2(backup_path, pptx_path)
+        except Exception as rollback_err:
+            logger.critical(f"ROLLBACK FAILED — PPTX may be corrupt: {rollback_err}")
         for d in fixable:
             d.status = DefectStatus.UNRESOLVED
         failed = list(fixable)

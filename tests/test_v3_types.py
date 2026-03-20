@@ -44,7 +44,7 @@ def test_v3defect_to_dict_serialization():
 
 def test_v3defect_to_legacy_compatibility_shape_and_fields():
     defect = V3Defect.critical(
-        "TABLE_GARBLED_LAYOUT",
+        "TABLE_GRID_STRUCTURAL_ERROR",
         6,
         object_id="123",
         evidence={"coordinates": {"x": 1, "y": 2}, "affected_text": "bad layout"},
@@ -57,7 +57,7 @@ def test_v3defect_to_legacy_compatibility_shape_and_fields():
 
     assert legacy["id"] == "S6-D001"
     assert legacy["layer"] == "xml"
-    assert legacy["check"] == "table_garbled_layout"
+    assert legacy["check"] == "table_grid_structural_error"
     assert legacy["severity"] == "CRITICAL"
     assert legacy["defect_type"] == "table"
     assert legacy["slide"] == 6
