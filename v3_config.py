@@ -47,7 +47,10 @@ ENABLE_V3_XML_AUTOFIX = _env_bool("V3_XML_AUTOFIX", False)
 ENABLE_V3_TABLE_FIX = _env_bool("V3_TABLE_AUTOFIX", False)
 
 # Gate mode: "shadow" (log but don't block) or "active" (enforce terminal statuses)
-V3_GATE_MODE = _env_str("V3_GATE_MODE", "shadow")
+# Default: "active" — pipeline.py now wires gate_result to PipelineResult,
+# so the gate decision flows to build_status_response() for API consumers.
+# Override to "shadow" via env var if you want logging without enforcement.
+V3_GATE_MODE = _env_str("V3_GATE_MODE", "active")
 
 # Enable enhanced vision prompts (table/icon/alignment categories)
 ENABLE_ENHANCED_PROMPTS = _env_bool("V3_ENHANCED_PROMPTS", False)

@@ -134,7 +134,7 @@ def test_v3_config_defaults_are_safe_off(monkeypatch):
     assert cfg.ENABLE_V3_VQA is False
     assert cfg.ENABLE_V3_XML_AUTOFIX is False
     assert cfg.ENABLE_V3_TABLE_FIX is False
-    assert cfg.V3_GATE_MODE == "shadow"
+    assert cfg.V3_GATE_MODE == "active"
     assert cfg.ENABLE_ENHANCED_PROMPTS is False
     assert cfg.ENABLE_VISION_XML_CTX is False
     assert cfg.ENABLE_SELECTIVE_VISION is False
@@ -155,5 +155,5 @@ def test_v3_config_default_helpers_report_disabled(monkeypatch):
     cfg = importlib.reload(v3_config)
 
     assert cfg.is_v3_enabled() is False
-    assert cfg.is_gate_active() is False
-    assert cfg.is_shadow_mode() is True
+    assert cfg.is_gate_active() is True
+    assert cfg.is_shadow_mode() is False
