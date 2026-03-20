@@ -109,6 +109,17 @@ class V3XMLChecker:
         defects.extend(self._check_merged_cell_integrity(slide_num, conv_slide_element))
         defects.extend(self._check_table_grid_structural(slide_num, conv_slide_element))
 
+        # Sprint 2 checks
+        if orig_slide_element is not None:
+            defects.extend(self._check_icon_table_correspondence(
+                slide_num, orig_slide_element, conv_slide_element))
+            defects.extend(self._check_shape_position_mirroring(
+                slide_num, orig_slide_element, conv_slide_element))
+
+        # Converted-only Sprint 2 checks
+        defects.extend(self._check_page_number_duplication(slide_num, conv_slide_element))
+        defects.extend(self._check_paragraph_rtl(slide_num, conv_slide_element))
+
         return defects
 
     # ── Check #1: Table Column Order Reversal (CRITICAL) ──
@@ -337,6 +348,289 @@ class V3XMLChecker:
 
         return defects
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # SPRINT 2 CHECKS: Icon (#3), Page Number (#4), Shape Position (#5),
+    #                  Paragraph RTL (#6)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── Check #3: Icon/Image in Wrong Table Cell (HIGH) ──
+
+    def _check_icon_table_correspondence(self, slide_num: int, orig_element, conv_element) -> list:
+        """Compare icon/image positions relative to table cells between orig and conv.
+        
+        Icons in tables should follow the cell reversal — an icon in column 0
+        of the original should be in the last column of the converted.
+        """
+        from vqa_types import V3Defect, Severity
+
+        defects = []
+        # Find graphic frames with images (pic elements)
+        orig_pics = orig_element.findall(f'.//{{{P_NS}}}pic') or []
+        conv_pics = conv_element.findall(f'.//{{{P_NS}}}pic') or []
+
+        # Also check for inline pics within shapes
+        orig_pics.extend(orig_element.findall(f'.//{{{A_NS}}}blipFill/..'))
+        conv_pics.extend(conv_element.findall(f'.//{{{A_NS}}}blipFill/..'))
+
+        if not orig_pics or not conv_pics:
+            return defects
+
+        # For each image, check if its x-position has been mirrored
+        for pic_idx, (orig_pic, conv_pic) in enumerate(zip(orig_pics, conv_pics)):
+            orig_off = orig_pic.find(f'.//{{{A_NS}}}off')
+            conv_off = conv_pic.find(f'.//{{{A_NS}}}off')
+            orig_ext = orig_pic.find(f'.//{{{A_NS}}}ext')
+
+            if orig_off is None or conv_off is None or orig_ext is None:
+                continue
+
+            try:
+                orig_x = int(orig_off.get('x', '0'))
+                conv_x = int(conv_off.get('x', '0'))
+                shape_w = int(orig_ext.get('cx', '0'))
+            except (ValueError, TypeError):
+                continue
+
+            if shape_w == 0:
+                continue
+
+            expected_x = self.slide_width - orig_x - shape_w
+            tolerance = max(int(self.slide_width * 0.02), 12000)  # 2% or 12000 EMU
+
+            if abs(conv_x - expected_x) > tolerance:
+                defects.append(V3Defect(
+                    code="ICON_IN_WRONG_TABLE_CELL",
+                    category="icon",
+                    severity=Severity.HIGH,
+                    slide_idx=slide_num,
+                    object_id=str(pic_idx),
+                    evidence={
+                        'original_x': orig_x,
+                        'converted_x': conv_x,
+                        'expected_x': expected_x,
+                        'shape_width': shape_w,
+                        'delta': abs(conv_x - expected_x),
+                    },
+                    fixable=True,
+                    autofix_action="reposition_icon",
+                    description=f"Icon {pic_idx} not mirrored correctly "
+                                f"(slide {slide_num}, delta={abs(conv_x - expected_x)} EMU)",
+                ))
+
+        return defects
+
+    # ── Check #4: Page Number Duplication (MEDIUM-HIGH) ──
+
+    def _check_page_number_duplication(self, slide_num: int, conv_element) -> list:
+        """Detect duplicate page numbers caused by field element duplication.
+        
+        Looks for:
+        1. Multiple <a:fld> with type containing 'slidenum' in same shape
+        2. Doubled-string patterns like '1515' in slide number text
+        3. Duplicate <a:r> runs adjacent to <a:fld>
+        """
+        from vqa_types import V3Defect, Severity
+
+        defects = []
+
+        # Search for all shapes with text bodies
+        for sp_idx, sp in enumerate(conv_element.iter(f'{{{P_NS}}}sp')):
+            txBody = sp.find(f'.//{{{P_NS}}}txBody')
+            if txBody is None:
+                txBody = sp.find(f'.//{{{A_NS}}}txBody')
+            if txBody is None:
+                continue
+
+            for para in txBody.iter(f'{{{A_NS}}}p'):
+                # Count slidenum fields in this paragraph
+                fields = [f for f in para.iter(f'{{{A_NS}}}fld')
+                          if 'slidenum' in (f.get('type', '') or '').lower()]
+
+                if len(fields) >= 2:
+                    defects.append(V3Defect(
+                        code="PAGE_NUMBER_DUPLICATED",
+                        category="numbering",
+                        severity=Severity.HIGH,
+                        slide_idx=slide_num,
+                        object_id=str(sp_idx),
+                        evidence={
+                            'field_count': len(fields),
+                        },
+                        fixable=True,
+                        autofix_action="dedup_page_number",
+                        description=f"Duplicate page number fields "
+                                    f"(slide {slide_num}, {len(fields)} fields)",
+                    ))
+                    break  # One defect per shape
+
+                # Check for doubled-string pattern in text runs
+                all_text = ''.join(
+                    t.text or ''
+                    for t in para.iter(f'{{{A_NS}}}t')
+                ).strip()
+
+                if all_text and len(all_text) >= 2 and len(all_text) % 2 == 0:
+                    half = len(all_text) // 2
+                    if all_text[:half] == all_text[half:] and all_text[:half].isdigit():
+                        defects.append(V3Defect(
+                            code="PAGE_NUMBER_DOUBLED_STRING",
+                            category="numbering",
+                            severity=Severity.MEDIUM,
+                            slide_idx=slide_num,
+                            object_id=str(sp_idx),
+                            evidence={
+                                'doubled_text': all_text,
+                            },
+                            fixable=True,
+                            autofix_action="dedup_page_number",
+                            description=f"Doubled page number string '{all_text}' "
+                                        f"(slide {slide_num})",
+                        ))
+                        break
+
+        return defects
+
+    # ── Check #5: Shape Position Mirroring Verification (HIGH) ──
+
+    def _check_shape_position_mirroring(
+        self, slide_num: int, orig_element, conv_element
+    ) -> list:
+        """Verify that non-centered shapes have mirrored x-positions.
+        
+        Expected: conv_x = slide_width - orig_x - shape_width
+        Tolerance: 2% of slide_width or 12000 EMU minimum.
+        
+        Skips: background shapes, centered shapes, shapes with SLIDEARABI_NS markers.
+        """
+        from vqa_types import V3Defect, Severity
+
+        defects = []
+        orig_shapes = list(orig_element.iter(f'{{{P_NS}}}sp'))
+        conv_shapes = list(conv_element.iter(f'{{{P_NS}}}sp'))
+
+        for shape_idx, (orig_sp, conv_sp) in enumerate(zip(orig_shapes, conv_shapes)):
+            # Skip shapes with SLIDEARABI_NS markers (intentionally not mirrored)
+            nvSpPr = conv_sp.find(f'{{{P_NS}}}nvSpPr')
+            if nvSpPr is not None:
+                cNvPr = nvSpPr.find(f'{{{P_NS}}}cNvPr')
+                if cNvPr is not None:
+                    # Check for any slidearabi custom attributes
+                    for attr_name in cNvPr.attrib:
+                        if SLIDEARABI_NS in attr_name:
+                            continue  # Skip marked shapes
+
+            # Get position and size
+            orig_off = orig_sp.find(f'.//{{{A_NS}}}off')
+            conv_off = conv_sp.find(f'.//{{{A_NS}}}off')
+            orig_ext = orig_sp.find(f'.//{{{A_NS}}}ext')
+
+            if orig_off is None or conv_off is None or orig_ext is None:
+                continue
+
+            try:
+                orig_x = int(orig_off.get('x', '0'))
+                orig_y = int(orig_off.get('y', '0'))
+                conv_x = int(conv_off.get('x', '0'))
+                shape_w = int(orig_ext.get('cx', '0'))
+                shape_h = int(orig_ext.get('cy', '0'))
+            except (ValueError, TypeError):
+                continue
+
+            # Skip very small shapes (decorative dots, bullets)
+            if shape_w < 50000 and shape_h < 50000:
+                continue
+
+            # Skip shapes that span most of the slide width (backgrounds, full-width bars)
+            if shape_w > self.slide_width * 0.85:
+                continue
+
+            # Skip centered shapes (within 5% tolerance of center)
+            center_x = (self.slide_width - shape_w) // 2
+            if abs(orig_x - center_x) < self.slide_width * 0.05:
+                continue
+
+            expected_x = self.slide_width - orig_x - shape_w
+            tolerance = max(int(self.slide_width * 0.02), 12000)
+
+            if abs(conv_x - expected_x) > tolerance:
+                defects.append(V3Defect(
+                    code="SHAPE_NOT_MIRRORED_POSITION",
+                    category="mirroring",
+                    severity=Severity.HIGH,
+                    slide_idx=slide_num,
+                    object_id=str(shape_idx),
+                    evidence={
+                        'original_x': orig_x,
+                        'converted_x': conv_x,
+                        'expected_x': expected_x,
+                        'shape_width': shape_w,
+                        'delta': abs(conv_x - expected_x),
+                    },
+                    fixable=True,
+                    autofix_action="mirror_shape_position",
+                    description=f"Shape {shape_idx} not mirrored "
+                                f"(slide {slide_num}, delta={abs(conv_x - expected_x)} EMU)",
+                ))
+
+        return defects
+
+    # ── Check #6: Non-Table Paragraph RTL Missing (MEDIUM-HIGH) ──
+
+    def _check_paragraph_rtl(self, slide_num: int, conv_element) -> list:
+        """Check that Arabic paragraphs outside tables have rtl='1'.
+        
+        Skips table cells (covered by Check #2) and empty paragraphs.
+        """
+        from vqa_types import V3Defect, Severity
+
+        defects = []
+        # Collect all <a:p> that are NOT inside tables
+        # Strategy: find all <a:p> and exclude those under <a:tbl>
+        table_paras = set()
+        for tbl in conv_element.iter(f'{{{A_NS}}}tbl'):
+            for p in tbl.iter(f'{{{A_NS}}}p'):
+                table_paras.add(id(p))
+
+        flagged_shapes = set()  # One defect per shape
+        for sp_idx, sp in enumerate(conv_element.iter(f'{{{P_NS}}}sp')):
+            for para in sp.iter(f'{{{A_NS}}}p'):
+                if id(para) in table_paras:
+                    continue
+
+                # Get paragraph text
+                para_text = ''.join(
+                    t.text or '' for t in para.iter(f'{{{A_NS}}}t')
+                ).strip()
+
+                if not para_text or not _has_arabic(para_text):
+                    continue
+
+                pPr = para.find(f'{{{A_NS}}}pPr')
+                rtl_ok = pPr is not None and pPr.get('rtl') == '1'
+
+                if not rtl_ok and sp_idx not in flagged_shapes:
+                    flagged_shapes.add(sp_idx)
+                    defects.append(V3Defect(
+                        code="PARAGRAPH_RTL_MISSING",
+                        category="alignment",
+                        severity=Severity.MEDIUM,
+                        slide_idx=slide_num,
+                        object_id=str(sp_idx),
+                        evidence={
+                            'sample_text': para_text[:50],
+                        },
+                        fixable=True,
+                        autofix_action="set_paragraph_rtl",
+                        description=f"Arabic paragraph missing rtl='1' "
+                                    f"(slide {slide_num}, shape {sp_idx})",
+                    ))
+
+        return defects
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # END SPRINT 2 CHECKS
+    # ─────────────────────────────────────────────────────────────────────────
+
     # ── Check #11: Table Grid Structural Integrity (CRITICAL, flag only) ──
 
     def _check_table_grid_structural(self, slide_num: int, conv_element) -> list:
@@ -400,6 +694,10 @@ class V3AutoFixer:
         self._dispatch = {
             'reverse_table_columns': self._fix_reverse_table_columns,
             'set_para_rtl': self._fix_set_para_rtl,
+            'reposition_icon': self._fix_reposition_icon,
+            'dedup_page_number': self._fix_dedup_page_number,
+            'mirror_shape_position': self._fix_mirror_shape_position,
+            'set_paragraph_rtl': self._fix_set_paragraph_rtl,
         }
 
     def apply_fix(self, slide_element, defect) -> bool:
@@ -537,6 +835,154 @@ class V3AutoFixer:
         if fixed:
             logger.info(f"V3 Fix: set RTL/alignment on slide {defect.slide_idx}, "
                          f"table {tbl_idx}")
+        return fixed
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SPRINT 2 FIXES
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── Fix #3: Reposition Icon to Mirrored Position ──
+
+    def _fix_reposition_icon(self, slide_element, defect) -> bool:
+        """Move icon/image to its expected mirrored x-position."""
+        pics = slide_element.findall(f'.//{{{P_NS}}}pic') or []
+        pics.extend(slide_element.findall(f'.//{{{A_NS}}}blipFill/..'))
+
+        try:
+            pic_idx = int(defect.object_id)
+        except (ValueError, TypeError):
+            return False
+
+        if pic_idx >= len(pics):
+            return False
+
+        pic = pics[pic_idx]
+        off = pic.find(f'.//{{{A_NS}}}off')
+        if off is None:
+            return False
+
+        expected_x = defect.evidence.get('expected_x')
+        if expected_x is None:
+            return False
+
+        off.set('x', str(expected_x))
+        logger.info(f"V3 Fix: repositioned icon {pic_idx} to x={expected_x} "
+                    f"(slide {defect.slide_idx})")
+        return True
+
+    # ── Fix #4: Deduplicate Page Number ──
+
+    def _fix_dedup_page_number(self, slide_element, defect) -> bool:
+        """Remove duplicate <a:fld> slidenum elements, keep the first one."""
+        shapes = list(slide_element.iter(f'{{{P_NS}}}sp'))
+
+        try:
+            sp_idx = int(defect.object_id)
+        except (ValueError, TypeError):
+            return False
+
+        if sp_idx >= len(shapes):
+            return False
+
+        sp = shapes[sp_idx]
+        fixed = False
+
+        for para in sp.iter(f'{{{A_NS}}}p'):
+            fields = [f for f in para.iter(f'{{{A_NS}}}fld')
+                      if 'slidenum' in (f.get('type', '') or '').lower()]
+
+            if len(fields) >= 2:
+                # Keep first, remove rest
+                for extra in fields[1:]:
+                    parent = extra.getparent()
+                    if parent is not None:
+                        parent.remove(extra)
+                        fixed = True
+
+        if fixed:
+            logger.info(f"V3 Fix: deduplicated page number on slide {defect.slide_idx}")
+        return fixed
+
+    # ── Fix #5: Mirror Shape Position ──
+
+    def _fix_mirror_shape_position(self, slide_element, defect) -> bool:
+        """Move shape to its expected mirrored x-position."""
+        shapes = list(slide_element.iter(f'{{{P_NS}}}sp'))
+
+        try:
+            shape_idx = int(defect.object_id)
+        except (ValueError, TypeError):
+            return False
+
+        if shape_idx >= len(shapes):
+            return False
+
+        sp = shapes[shape_idx]
+        off = sp.find(f'.//{{{A_NS}}}off')
+        if off is None:
+            return False
+
+        expected_x = defect.evidence.get('expected_x')
+        if expected_x is None:
+            return False
+
+        off.set('x', str(expected_x))
+        logger.info(f"V3 Fix: mirrored shape {shape_idx} to x={expected_x} "
+                    f"(slide {defect.slide_idx})")
+        return True
+
+    # ── Fix #6: Set RTL on Non-Table Paragraphs ──
+
+    def _fix_set_paragraph_rtl(self, slide_element, defect) -> bool:
+        """Set rtl='1' on Arabic paragraphs in non-table shapes."""
+        shapes = list(slide_element.iter(f'{{{P_NS}}}sp'))
+
+        try:
+            sp_idx = int(defect.object_id)
+        except (ValueError, TypeError):
+            return False
+
+        if sp_idx >= len(shapes):
+            return False
+
+        sp = shapes[sp_idx]
+        fixed = False
+
+        # Collect table paragraphs to exclude
+        table_paras = set()
+        for tbl in slide_element.iter(f'{{{A_NS}}}tbl'):
+            for p in tbl.iter(f'{{{A_NS}}}p'):
+                table_paras.add(id(p))
+
+        for para in sp.iter(f'{{{A_NS}}}p'):
+            if id(para) in table_paras:
+                continue
+
+            para_text = ''.join(
+                t.text or '' for t in para.iter(f'{{{A_NS}}}t')
+            ).strip()
+
+            if not para_text or not _has_arabic(para_text):
+                continue
+
+            pPr = para.find(f'{{{A_NS}}}pPr')
+            if pPr is None:
+                pPr = etree.Element(f'{{{A_NS}}}pPr')
+                para.insert(0, pPr)
+
+            if pPr.get('rtl') != '1':
+                pPr.set('rtl', '1')
+                fixed = True
+
+            # Set alignment to right for Arabic text (unless explicitly centered)
+            current_algn = pPr.get('algn', '')
+            if current_algn != 'ctr' and current_algn != 'r':
+                pPr.set('algn', 'r')
+                fixed = True
+
+        if fixed:
+            logger.info(f"V3 Fix: set paragraph RTL on shape {sp_idx} "
+                        f"(slide {defect.slide_idx})")
         return fixed
 
 
