@@ -1879,8 +1879,13 @@ class SlideContentTransformer:
                             run.text = ''
                     else:
                         # No runs — paragraph has field/special elements
-                        # Create a new run with the translation
+                        # Round 4 fix: Remove <a:fld> (field) elements before
+                        # appending new run. Fields like slidenum render their
+                        # value; adding a run without removing the field causes
+                        # doubling (e.g., "15" + "15" = "1515").
                         p_elem = para._p
+                        for fld in p_elem.findall(f'{{{A_NS}}}fld'):
+                            p_elem.remove(fld)
                         r_elem = etree.SubElement(p_elem, f'{{{A_NS}}}r')
                         t_elem = etree.SubElement(r_elem, f'{{{A_NS}}}t')
                         t_elem.text = arabic_text
