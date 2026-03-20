@@ -27,6 +27,9 @@ P_NS = 'http://schemas.openxmlformats.org/presentationml/2006/main'
 R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
 SLIDEARABI_NS = 'https://slidearabi.ai/ns/transform'
 
+# Idempotency marker attribute (shared between checks and fixes)
+V3_PHYS_REV_MARKER = f'{{{SLIDEARABI_NS}}}v3PhysRev'
+
 # Arabic character detection
 import re
 _ARABIC_RE = re.compile(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]')
@@ -162,11 +165,10 @@ class V3XMLChecker:
             # After proper RTL conversion, column order should be reversed
             if anchor_orig == anchor_conv:
                 # Columns NOT reversed — this is a defect
-                # Check idempotency marker
+                # Check idempotency marker (matches Fix #1 marker)
                 conv_tbl_pr = _get_tbl_pr(conv_tbl)
-                marker = f'{{{SLIDEARABI_NS}}}physRtlCols'
-                if conv_tbl_pr is not None and conv_tbl_pr.get(marker) == '1':
-                    continue  # Already processed
+                if conv_tbl_pr is not None and conv_tbl_pr.get(V3_PHYS_REV_MARKER) == '1':
+                    continue  # Already processed by V3 fix
 
                 defects.append(V3Defect(
                     code="TABLE_COLUMNS_NOT_REVERSED",
@@ -273,10 +275,9 @@ class V3XMLChecker:
 
             # After RTL conversion, gridCol widths should be reversed
             if orig_widths == conv_widths:
-                # Check idempotency
+                # Check idempotency (matches Fix #1 marker)
                 conv_tbl_pr = _get_tbl_pr(conv_tbl)
-                marker = f'{{{SLIDEARABI_NS}}}physRtlCols'
-                if conv_tbl_pr is not None and conv_tbl_pr.get(marker) == '1':
+                if conv_tbl_pr is not None and conv_tbl_pr.get(V3_PHYS_REV_MARKER) == '1':
                     continue
 
                 defects.append(V3Defect(
@@ -357,7 +358,10 @@ class V3XMLChecker:
                 # Account for gridSpan in cell count
                 effective_cols = 0
                 for cell in cells:
-                    span = int(cell.get('gridSpan', '1'))
+                    try:
+                        span = int(cell.get('gridSpan', '1'))
+                    except (ValueError, TypeError):
+                        span = 1
                     effective_cols += span
 
                 if effective_cols != num_grid_cols:
@@ -438,10 +442,9 @@ class V3AutoFixer:
                 except ValueError:
                     pass
 
-        # Check idempotency marker
+        # Check idempotency marker (shared constant with checks)
         tbl_pr = _get_tbl_pr(tbl)
-        marker = f'{{{self.MARKER_NS}}}v3PhysRev'
-        if tbl_pr is not None and tbl_pr.get(marker) == '1':
+        if tbl_pr is not None and tbl_pr.get(V3_PHYS_REV_MARKER) == '1':
             logger.debug(f"Table already reversed (v3 marker), skipping")
             return False
 
@@ -469,11 +472,12 @@ class V3AutoFixer:
 
         # Set rtl='0' to prevent double-reversal
         if tbl_pr is None:
-            tbl_pr = etree.SubElement(tbl, f'{{{A_NS}}}tblPr')
+            tbl_pr = etree.Element(f'{{{A_NS}}}tblPr')
+            tbl.insert(0, tbl_pr)  # tblPr must be first child per OOXML schema
         tbl_pr.set('rtl', '0')
 
         # Set idempotency marker
-        tbl_pr.set(marker, '1')
+        tbl_pr.set(V3_PHYS_REV_MARKER, '1')
 
         # Swap firstCol/lastCol toggles
         first_col = tbl_pr.get('firstCol')
@@ -662,6 +666,11 @@ def safe_apply_fixes(
             PptxPresentation(pptx_path)
             logger.info(f"V3 fixes applied: {len(applied)} succeeded, "
                         f"{len(failed)} failed")
+            # Clean up backup on success
+            try:
+                Path(backup_path).unlink(missing_ok=True)
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"PPTX validation failed after fixes, rolling back: {e}")
             shutil.copy2(backup_path, pptx_path)

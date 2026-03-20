@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from v3_checks import (
     V3AutoFixer,
     V3XMLChecker,
+    V3_PHYS_REV_MARKER,
     _find_tables,
     _get_cell_text,
     _get_gridcols,
@@ -190,9 +191,9 @@ class TestCheckTableColumnOrder:
         orig_tbl = _make_table([['A', 'B', 'C']])
         conv_tbl = _make_table([['A', 'B', 'C']])  # Same order but has marker
         
-        # Set marker on conv table
+        # Set marker on conv table (using shared constant)
         tbl_pr = conv_tbl.find(f'{{{A_NS}}}tblPr')
-        tbl_pr.set(f'{{{SLIDEARABI_NS}}}physRtlCols', '1')
+        tbl_pr.set(V3_PHYS_REV_MARKER, '1')
 
         orig_slide = _wrap_in_slide(orig_tbl)
         conv_slide = _wrap_in_slide(conv_tbl)
@@ -723,6 +724,73 @@ class TestCheckSlideIntegration:
         # These require original, should NOT appear
         assert "TABLE_COLUMNS_NOT_REVERSED" not in codes
         assert "TABLE_GRIDCOL_NOT_REVERSED" not in codes
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER FUNCTION TESTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUND-TRIP REGRESSION: Fix → Re-check → 0 defects
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRoundTripRegression:
+    """Verify that applying a fix then re-running checks produces 0 defects.
+    This is the P0 test that validates the idempotency marker contract."""
+
+    def test_fix1_then_recheck_yields_zero_defects(self):
+        """Apply reverse_table_columns, re-run check #1 + #9 → 0 defects."""
+        orig_tbl = _make_table(
+            [['A', 'B', 'C'], ['1', '2', '3']],
+            gridcol_widths=[1000, 2000, 3000],
+        )
+        conv_tbl = _make_table(
+            [['A', 'B', 'C'], ['1', '2', '3']],  # Not reversed
+            gridcol_widths=[1000, 2000, 3000],
+        )
+        orig_slide = _wrap_in_slide(orig_tbl)
+        conv_slide = _wrap_in_slide(conv_tbl)
+
+        checker = V3XMLChecker()
+        fixer = V3AutoFixer()
+
+        # Step 1: Detect defects
+        defects = checker.check_slide(1, conv_slide, orig_slide)
+        col_defects = [d for d in defects if d.code == 'TABLE_COLUMNS_NOT_REVERSED']
+        grid_defects = [d for d in defects if d.code == 'TABLE_GRIDCOL_NOT_REVERSED']
+        assert len(col_defects) >= 1
+        assert len(grid_defects) >= 1
+
+        # Step 2: Apply fix
+        for d in col_defects:
+            fixer.apply_fix(conv_slide, d)
+
+        # Step 3: Re-check — should find 0 column/gridCol defects
+        defects_after = checker.check_slide(1, conv_slide, orig_slide)
+        col_defects_after = [d for d in defects_after if d.code == 'TABLE_COLUMNS_NOT_REVERSED']
+        grid_defects_after = [d for d in defects_after if d.code == 'TABLE_GRIDCOL_NOT_REVERSED']
+        assert len(col_defects_after) == 0, f"Expected 0 column defects after fix, got {len(col_defects_after)}"
+        assert len(grid_defects_after) == 0, f"Expected 0 gridCol defects after fix, got {len(grid_defects_after)}"
+
+    def test_fix2_then_recheck_yields_zero_defects(self):
+        """Apply set_para_rtl, re-run check #2 → 0 defects."""
+        tbl = _make_table([['مرحبا', 'Hello']])
+        slide = _wrap_in_slide(tbl)
+
+        checker = V3XMLChecker()
+        fixer = V3AutoFixer()
+
+        # Step 1: Detect RTL defects
+        defects = checker._check_table_cell_alignment(1, slide)
+        assert len(defects) >= 1
+
+        # Step 2: Apply fix
+        for d in defects:
+            fixer.apply_fix(slide, d)
+
+        # Step 3: Re-check — should find 0
+        defects_after = checker._check_table_cell_alignment(1, slide)
+        assert len(defects_after) == 0, f"Expected 0 RTL defects after fix, got {len(defects_after)}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

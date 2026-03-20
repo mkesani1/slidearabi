@@ -2632,8 +2632,9 @@ def run_vqa_v3(
     """
     V3 quality-gated VQA entry point.
 
-    Runs the full V2 VQA pipeline (run_vqa) AND the V3 XML structural checks
-    + gate decision. Returns both the VQA report and a V3 gate result.
+    Runs the full VQA pipeline (run_vqa) — which internally runs V3 XML
+    structural checks if enabled — then computes a gate decision from
+    the post-fix state of the converted PPTX.
 
     The V3 pipeline is controlled by v3_config feature flags:
       - V3_XML_CHECKS=1    → enable XML structural checks
@@ -2646,7 +2647,7 @@ def run_vqa_v3(
     """
     import v3_config
 
-    # Run standard VQA pipeline (which now internally runs V3 checks if enabled)
+    # Run standard VQA pipeline (which internally runs V3 checks + fixes if enabled)
     vqa_report = run_vqa(
         original_pptx=original_pptx,
         converted_pptx=converted_pptx,
@@ -2667,30 +2668,27 @@ def run_vqa_v3(
 
     if v3_config.is_v3_enabled():
         try:
-            from v3_checks import run_v3_xml_checks, safe_apply_fixes, compute_gate_decision
-            from vqa_types import VQAGateResult
+            from v3_checks import run_v3_xml_checks, compute_gate_decision
+            from vqa_types import VQAGateResult, DefectStatus
 
-            # Run V3 checks for gate decision (post-fix state)
+            # Re-check POST-FIX state of the converted PPTX for gate decision.
+            # This is a fast XML-only scan (no PPTX save, no vision calls).
+            # It reads the already-fixed file, so it only sees remaining defects.
             defects, meta = run_v3_xml_checks(
                 orig_pptx_path=original_pptx,
                 conv_pptx_path=converted_pptx,
             )
 
-            # Separate unresolved from fixed
-            from vqa_types import DefectStatus
-            unresolved = [d for d in defects if d.status != DefectStatus.FIXED]
-
-            # Compute gate decision
+            # All defects from this post-fix scan are unresolved by definition
+            # (if fixes worked, these defects won't appear due to idempotency markers)
             from pptx import Presentation as PptxPresentation
             prs = PptxPresentation(converted_pptx)
             total_slides = len(prs.slides)
 
-            gate_result = compute_gate_decision(unresolved, total_slides)
+            gate_result = compute_gate_decision(defects, total_slides)
             gate_result.slides_checked_xml = meta['slides_checked']
             gate_result.defects_found = meta['total_defects']
-            gate_result.defects_fixed = meta['fixable_count'] - len(
-                [d for d in defects if d.fixable and d.status != DefectStatus.FIXED]
-            )
+            gate_result.defects_fixed = 0  # Post-fix scan — fixes already applied
 
             logger.info(
                 f"VQA V3 gate: {gate_result.status} "
