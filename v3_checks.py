@@ -120,6 +120,13 @@ class V3XMLChecker:
         defects.extend(self._check_page_number_duplication(slide_num, conv_slide_element))
         defects.extend(self._check_paragraph_rtl(slide_num, conv_slide_element))
 
+        # Sprint 3 checks
+        defects.extend(self._check_circular_text_centering(slide_num, conv_slide_element))
+        defects.extend(self._check_directional_symbol_orientation(slide_num, conv_slide_element))
+        if orig_slide_element is not None:
+            defects.extend(self._check_master_element_mirroring(
+                slide_num, orig_slide_element, conv_slide_element))
+
         return defects
 
     # ── Check #1: Table Column Order Reversal (CRITICAL) ──
@@ -638,7 +645,278 @@ class V3XMLChecker:
         return defects
 
     # ─────────────────────────────────────────────────────────────────────────
-    # END SPRINT 2 CHECKS
+    # SPRINT 3 CHECKS: Circular centering (#7), Master mirror (#8),
+    #                  Directional orientation (#12)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Preset geometry types for circular shapes
+    CIRCULAR_PRESETS = frozenset([
+        'ellipse', 'pie', 'donut', 'arc', 'blockArc',
+        'flowChartConnector', 'flowChartPunchedTape',
+        'actionButtonBlank',  # often used as circle buttons
+    ])
+
+    # Preset geometry types for directional shapes (rightward by default)
+    DIRECTIONAL_PRESETS = frozenset([
+        'rightArrow', 'stripedRightArrow', 'notchedRightArrow',
+        'bentArrow', 'uturnArrow', 'curvedRightArrow',
+        'chevron', 'homePlate', 'rightArrowCallout',
+        'circularArrow', 'swooshArrow',
+        'rightTriangle',
+    ])
+
+    # ── Check #7: Text Centering in Circular/Venn Shapes (MEDIUM) ──
+
+    def _check_circular_text_centering(self, slide_num: int, conv_element) -> list:
+        """Verify text in circular/near-square shapes has centered alignment.
+        
+        Checks prstGeom-based detection + aspect-ratio fallback (width within
+        20% of height). Requires algn='ctr' and anchor='ctr' on text body.
+        """
+        from vqa_types import V3Defect, Severity
+
+        defects = []
+
+        for sp_idx, sp in enumerate(conv_element.iter(f'{{{P_NS}}}sp')):
+            # Get preset geometry
+            spPr = sp.find(f'{{{P_NS}}}spPr')
+            if spPr is None:
+                spPr = sp.find(f'{{{A_NS}}}spPr')
+            if spPr is None:
+                continue
+
+            prstGeom = spPr.find(f'{{{A_NS}}}prstGeom')
+            prst = prstGeom.get('prst', '') if prstGeom is not None else ''
+
+            # Get dimensions for aspect ratio check
+            ext = spPr.find(f'.//{{{A_NS}}}ext')
+            is_circular = prst in self.CIRCULAR_PRESETS
+
+            if not is_circular and ext is not None:
+                try:
+                    cx = int(ext.get('cx', '0'))
+                    cy = int(ext.get('cy', '0'))
+                    if cx > 0 and cy > 0:
+                        ratio = max(cx, cy) / min(cx, cy)
+                        if ratio <= 1.2:  # Near-square = likely circular
+                            is_circular = True
+                except (ValueError, TypeError):
+                    pass
+
+            if not is_circular:
+                continue
+
+            # Check for text content
+            txBody = sp.find(f'{{{P_NS}}}txBody')
+            if txBody is None:
+                txBody = sp.find(f'{{{A_NS}}}txBody')
+            if txBody is None:
+                continue
+
+            has_text = False
+            for para in txBody.iter(f'{{{A_NS}}}p'):
+                para_text = ''.join(
+                    t.text or '' for t in para.iter(f'{{{A_NS}}}t')
+                ).strip()
+                if para_text:
+                    has_text = True
+                    break
+
+            if not has_text:
+                continue
+
+            # Check centering: algn='ctr' on paragraphs and anchor='ctr' on bodyPr
+            bodyPr = txBody.find(f'{{{A_NS}}}bodyPr')
+            anchor_ok = bodyPr is not None and bodyPr.get('anchor') == 'ctr'
+
+            algn_ok = True
+            for para in txBody.iter(f'{{{A_NS}}}p'):
+                para_text = ''.join(
+                    t.text or '' for t in para.iter(f'{{{A_NS}}}t')
+                ).strip()
+                if not para_text:
+                    continue
+                pPr = para.find(f'{{{A_NS}}}pPr')
+                if pPr is None or pPr.get('algn') != 'ctr':
+                    algn_ok = False
+                    break
+
+            if not algn_ok or not anchor_ok:
+                issues = []
+                if not algn_ok:
+                    issues.append('algn not ctr')
+                if not anchor_ok:
+                    issues.append('anchor not ctr')
+
+                defects.append(V3Defect(
+                    code="TEXT_NOT_CENTERED_IN_SHAPE",
+                    category="alignment",
+                    severity=Severity.MEDIUM,
+                    slide_idx=slide_num,
+                    object_id=str(sp_idx),
+                    evidence={
+                        'preset': prst,
+                        'issues': issues,
+                    },
+                    fixable=True,
+                    autofix_action="center_text_circular",
+                    description=f"Text not centered in circular shape "
+                                f"(slide {slide_num}, shape {sp_idx}, "
+                                f"prst={prst or 'aspect-ratio'})",
+                ))
+
+        return defects
+
+    # ── Check #8: Master/Layout Decorative Element Mirroring (MEDIUM) ──
+
+    def _check_master_element_mirroring(
+        self, slide_num: int, orig_element, conv_element
+    ) -> list:
+        """Check master/layout decorative shapes are mirrored.
+        
+        Looks at shape names containing common master patterns (line, rect,
+        background, decorator) and verifies x-position mirroring.
+        Skips centered and full-width shapes.
+        """
+        from vqa_types import V3Defect, Severity
+
+        defects = []
+        MASTER_PATTERNS = ('line', 'rect', 'background', 'decorator',
+                          'border', 'stripe', 'bar', 'accent', 'freeform')
+
+        orig_shapes = list(orig_element.iter(f'{{{P_NS}}}sp'))
+        conv_shapes = list(conv_element.iter(f'{{{P_NS}}}sp'))
+
+        for shape_idx, (orig_sp, conv_sp) in enumerate(zip(orig_shapes, conv_shapes)):
+            # Check if this looks like a master/decorative element
+            nvSpPr = conv_sp.find(f'{{{P_NS}}}nvSpPr')
+            if nvSpPr is None:
+                continue
+            cNvPr = nvSpPr.find(f'{{{P_NS}}}cNvPr')
+            if cNvPr is None:
+                continue
+
+            name = (cNvPr.get('name', '') or '').lower()
+
+            # Only check shapes that match master patterns
+            is_master = any(pat in name for pat in MASTER_PATTERNS)
+            if not is_master:
+                continue
+
+            # Skip shapes with SLIDEARABI_NS markers
+            if any(SLIDEARABI_NS in a for a in cNvPr.attrib):
+                continue
+
+            # Get positions
+            orig_off = orig_sp.find(f'.//{{{A_NS}}}off')
+            conv_off = conv_sp.find(f'.//{{{A_NS}}}off')
+            orig_ext = orig_sp.find(f'.//{{{A_NS}}}ext')
+
+            if orig_off is None or conv_off is None or orig_ext is None:
+                continue
+
+            try:
+                orig_x = int(orig_off.get('x', '0'))
+                conv_x = int(conv_off.get('x', '0'))
+                shape_w = int(orig_ext.get('cx', '0'))
+            except (ValueError, TypeError):
+                continue
+
+            if shape_w == 0:
+                continue
+
+            # Skip full-width
+            if shape_w > self.slide_width * 0.85:
+                continue
+
+            # Skip centered
+            center_x = (self.slide_width - shape_w) // 2
+            if abs(orig_x - center_x) < self.slide_width * 0.05:
+                continue
+
+            expected_x = self.slide_width - orig_x - shape_w
+            if expected_x < 0:
+                continue
+
+            tolerance = max(int(self.slide_width * 0.02), 12000)
+
+            if abs(conv_x - expected_x) > tolerance:
+                defects.append(V3Defect(
+                    code="MASTER_ELEMENT_NOT_MIRRORED",
+                    category="mirroring",
+                    severity=Severity.MEDIUM,
+                    slide_idx=slide_num,
+                    object_id=str(shape_idx),
+                    evidence={
+                        'shape_name': name,
+                        'original_x': orig_x,
+                        'converted_x': conv_x,
+                        'expected_x': expected_x,
+                        'shape_width': shape_w,
+                        'delta': abs(conv_x - expected_x),
+                    },
+                    fixable=True,
+                    autofix_action="mirror_shape_position",
+                    description=f"Master element '{name}' not mirrored "
+                                f"(slide {slide_num}, delta={abs(conv_x - expected_x)} EMU)",
+                ))
+
+        return defects
+
+    # ── Check #12: Directional Symbol Orientation (HIGH) ──
+
+    def _check_directional_symbol_orientation(
+        self, slide_num: int, conv_element
+    ) -> list:
+        """Check that directional preset shapes (arrows, chevrons) have flipH='1'.
+        
+        In RTL conversion, rightward-pointing shapes must be horizontally flipped
+        to point leftward. Detection is based on prstGeom, not shape name keywords.
+        """
+        from vqa_types import V3Defect, Severity
+
+        defects = []
+
+        for sp_idx, sp in enumerate(conv_element.iter(f'{{{P_NS}}}sp')):
+            spPr = sp.find(f'{{{P_NS}}}spPr')
+            if spPr is None:
+                spPr = sp.find(f'{{{A_NS}}}spPr')
+            if spPr is None:
+                continue
+
+            prstGeom = spPr.find(f'{{{A_NS}}}prstGeom')
+            if prstGeom is None:
+                continue
+
+            prst = prstGeom.get('prst', '')
+            if prst not in self.DIRECTIONAL_PRESETS:
+                continue
+
+            # Check for flipH on xfrm
+            xfrm = spPr.find(f'{{{A_NS}}}xfrm')
+            has_flipH = xfrm is not None and xfrm.get('flipH') == '1'
+
+            if not has_flipH:
+                defects.append(V3Defect(
+                    code="DIRECTIONAL_SHAPE_NOT_FLIPPED",
+                    category="mirroring",
+                    severity=Severity.HIGH,
+                    slide_idx=slide_num,
+                    object_id=str(sp_idx),
+                    evidence={
+                        'preset': prst,
+                        'current_flipH': xfrm.get('flipH', 'missing') if xfrm is not None else 'no_xfrm',
+                    },
+                    fixable=True,
+                    autofix_action="flip_directional_shape",
+                    description=f"Directional shape '{prst}' not flipped for RTL "
+                                f"(slide {slide_num}, shape {sp_idx})",
+                ))
+
+        return defects
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # END SPRINT 3 CHECKS
     # ─────────────────────────────────────────────────────────────────────────
 
     # ── Check #11: Table Grid Structural Integrity (CRITICAL, flag only) ──
@@ -708,6 +986,9 @@ class V3AutoFixer:
             'dedup_page_number': self._fix_dedup_page_number,
             'mirror_shape_position': self._fix_mirror_shape_position,
             'set_paragraph_rtl': self._fix_set_paragraph_rtl,
+            # Sprint 3 fixes
+            'center_text_circular': self._fix_center_text_circular,
+            'flip_directional_shape': self._fix_flip_directional_shape,
         }
 
     def apply_fix(self, slide_element, defect) -> bool:
@@ -1010,6 +1291,98 @@ class V3AutoFixer:
             logger.info(f"V3 Fix: set paragraph RTL on shape {sp_idx} "
                         f"(slide {defect.slide_idx})")
         return fixed
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SPRINT 3 FIXES
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── Fix #7: Center Text in Circular Shapes ──
+
+    def _fix_center_text_circular(self, slide_element, defect) -> bool:
+        """Set algn='ctr' on paragraphs and anchor='ctr' on bodyPr."""
+        shapes = list(slide_element.iter(f'{{{P_NS}}}sp'))
+
+        try:
+            sp_idx = int(defect.object_id)
+        except (ValueError, TypeError):
+            return False
+
+        if sp_idx >= len(shapes):
+            return False
+
+        sp = shapes[sp_idx]
+        txBody = sp.find(f'{{{P_NS}}}txBody')
+        if txBody is None:
+            txBody = sp.find(f'{{{A_NS}}}txBody')
+        if txBody is None:
+            return False
+
+        fixed = False
+
+        # Set anchor='ctr' on bodyPr
+        bodyPr = txBody.find(f'{{{A_NS}}}bodyPr')
+        if bodyPr is None:
+            bodyPr = etree.SubElement(txBody, f'{{{A_NS}}}bodyPr')
+            txBody.remove(bodyPr)
+            txBody.insert(0, bodyPr)
+        if bodyPr.get('anchor') != 'ctr':
+            bodyPr.set('anchor', 'ctr')
+            fixed = True
+
+        # Set algn='ctr' on all text-bearing paragraphs
+        for para in txBody.iter(f'{{{A_NS}}}p'):
+            para_text = ''.join(
+                t.text or '' for t in para.iter(f'{{{A_NS}}}t')
+            ).strip()
+            if not para_text:
+                continue
+            pPr = para.find(f'{{{A_NS}}}pPr')
+            if pPr is None:
+                pPr = etree.Element(f'{{{A_NS}}}pPr')
+                para.insert(0, pPr)
+            if pPr.get('algn') != 'ctr':
+                pPr.set('algn', 'ctr')
+                fixed = True
+
+        if fixed:
+            logger.info(f"V3 Fix: centered text in circular shape {sp_idx} "
+                        f"(slide {defect.slide_idx})")
+        return fixed
+
+    # ── Fix #12: Flip Directional Shape for RTL ──
+
+    def _fix_flip_directional_shape(self, slide_element, defect) -> bool:
+        """Set flipH='1' on directional shape's xfrm."""
+        shapes = list(slide_element.iter(f'{{{P_NS}}}sp'))
+
+        try:
+            sp_idx = int(defect.object_id)
+        except (ValueError, TypeError):
+            return False
+
+        if sp_idx >= len(shapes):
+            return False
+
+        sp = shapes[sp_idx]
+        spPr = sp.find(f'{{{P_NS}}}spPr')
+        if spPr is None:
+            spPr = sp.find(f'{{{A_NS}}}spPr')
+        if spPr is None:
+            return False
+
+        xfrm = spPr.find(f'{{{A_NS}}}xfrm')
+        if xfrm is None:
+            xfrm = etree.SubElement(spPr, f'{{{A_NS}}}xfrm')
+            spPr.remove(xfrm)
+            spPr.insert(0, xfrm)
+
+        if xfrm.get('flipH') == '1':
+            return False  # Already flipped
+
+        xfrm.set('flipH', '1')
+        logger.info(f"V3 Fix: flipped directional shape {sp_idx} "
+                    f"(slide {defect.slide_idx}, prst={defect.evidence.get('preset', '?')})")
+        return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
