@@ -96,6 +96,19 @@ class PipelineResult:
     total_duration_ms: float
     error: Optional[str] = None
     gate_result: Optional[Any] = None  # V3 VQAGateResult (None if V3 disabled)
+    visual_gate_report: Optional[Any] = None  # Visual regression gate report
+
+# Visual Regression Gate — deterministic pixel-level quality check
+HAS_VISUAL_GATE = False
+try:
+    from slidearabi.visual_gate import run_visual_gate, GateReport as VisualGateReport
+    HAS_VISUAL_GATE = True
+except ImportError:
+    try:
+        from visual_gate import run_visual_gate, GateReport as VisualGateReport
+        HAS_VISUAL_GATE = True
+    except ImportError:
+        pass
 
 # Phase 6 (VQA) and LLM translation — optional but wired when available
 try:
@@ -249,11 +262,25 @@ class SlideArabiPipeline:
             except Exception as e:
                 raise IOError(f"Failed to save presentation: {e}")
             
-            # Phase 6: Visual QA (dual-pass: Gemini + Claude)
+            # Phase 6a: Visual Regression Gate (deterministic, pixel-level)
+            visual_gate_report = self._phase_6a_visual_gate()
+            
+            # Phase 6b: Visual QA (dual-pass: Gemini + Claude)
             vqa_report, gate_result = self._phase_6_vqa()
             
             total_duration = (time.monotonic() - pipeline_start) * 1000
             logger.info(f"Pipeline completed successfully in {total_duration:.0f}ms")
+            
+            # Log visual gate results
+            if visual_gate_report is not None:
+                logger.info(
+                    "Visual Gate: %d/%d slides passed (%.1f%%), %d FAIL, %d WARN",
+                    visual_gate_report.pass_count,
+                    visual_gate_report.slides_analyzed,
+                    visual_gate_report.pass_rate,
+                    visual_gate_report.fail_count,
+                    visual_gate_report.warn_count,
+                )
             
             # Log V3 gate decision at pipeline level
             if gate_result is not None:
@@ -271,6 +298,7 @@ class SlideArabiPipeline:
                 validation_report=val_report,
                 total_duration_ms=total_duration,
                 gate_result=gate_result,
+                visual_gate_report=visual_gate_report,
             )
             
         except Exception as e:
@@ -693,6 +721,68 @@ class SlideArabiPipeline:
                 untranslated_slides.append(i)
 
         return untranslated_slides
+
+    def _phase_6a_visual_gate(self) -> Optional[Any]:
+        """Phase 6a: Deterministic Visual Regression Gate.
+        
+        Renders original (EN) and converted (AR) slides to images,
+        computes structural metrics (ink density, edge density, tile
+        occupancy, border overflow), and gates each slide as
+        PASS / WARN / FAIL using hard thresholds.
+        
+        No LLM reasoning. No auto-fix. Purely deterministic.
+        
+        Returns:
+            GateReport or None if module unavailable.
+        """
+        start_time = time.monotonic()
+        logger.info("Phase 6a: Visual Regression Gate (deterministic)...")
+        
+        if not HAS_VISUAL_GATE:
+            logger.warning("Phase 6a skipped: visual_gate module not available")
+            self._log_phase('phase_6a_visual_gate', 0, {"status": "module_unavailable"})
+            return None
+        
+        if not self.config.input_path or not self.config.output_path:
+            logger.warning("Phase 6a skipped: missing input/output paths")
+            self._log_phase('phase_6a_visual_gate', 0, {"status": "missing_paths"})
+            return None
+        
+        output_dir = Path(self.config.output_path).parent
+        deck_stem = Path(self.config.output_path).stem
+        issue_log_path = str(output_dir / f"{deck_stem}_visual_gate.jsonl")
+        
+        try:
+            report = run_visual_gate(
+                original_pptx=self.config.input_path,
+                converted_pptx=self.config.output_path,
+                deck_name=deck_stem,
+                issue_log_path=issue_log_path,
+            )
+            
+            duration = (time.monotonic() - start_time) * 1000
+            self._log_phase('phase_6a_visual_gate', duration, {
+                "status": "success",
+                "total_slides": report.total_slides,
+                "slides_analyzed": report.slides_analyzed,
+                "pass_count": report.pass_count,
+                "warn_count": report.warn_count,
+                "fail_count": report.fail_count,
+                "skip_count": report.skip_count,
+                "pass_rate": round(report.pass_rate, 1),
+                "fail_rate": round(report.fail_rate, 1),
+            })
+            
+            return report
+            
+        except Exception as e:
+            logger.warning(f"Phase 6a Visual Gate failed (non-fatal): {e}")
+            duration = (time.monotonic() - start_time) * 1000
+            self._log_phase('phase_6a_visual_gate', duration, {
+                "status": "error",
+                "error": str(e),
+            })
+            return None
 
     def _phase_6_vqa(
         self,
