@@ -2158,6 +2158,41 @@ class VisualQualityAssurance:
                 comp_dir=comp_dir,
             )
 
+            # ── V3 Layer 1: XML structural checks (fast, deterministic) ────
+            v3_xml_defects_by_slide: Dict[int, list] = {}
+            try:
+                import v3_config
+                if v3_config.is_v3_enabled():
+                    from v3_checks import run_v3_xml_checks, safe_apply_fixes
+                    logger.info("VQA V3: Running Layer 1 XML structural checks...")
+                    v3_defects, v3_meta = run_v3_xml_checks(
+                        orig_pptx_path=self.config.original_pptx,
+                        conv_pptx_path=self.config.converted_pptx,
+                    )
+                    # Group by slide for passing to vision layer
+                    for d in v3_defects:
+                        v3_xml_defects_by_slide.setdefault(d.slide_idx, []).append(d)
+
+                    logger.info(
+                        f"VQA V3 Layer 1: {v3_meta['total_defects']} defects "
+                        f"({v3_meta['critical_count']} critical, "
+                        f"{v3_meta['fixable_count']} fixable)"
+                    )
+
+                    # Apply auto-fixes if enabled
+                    if v3_config.ENABLE_V3_XML_AUTOFIX and v3_meta['fixable_count'] > 0:
+                        logger.info("VQA V3: Applying XML auto-fixes...")
+                        applied, failed = safe_apply_fixes(
+                            pptx_path=self.config.converted_pptx,
+                            defects=v3_defects,
+                        )
+                        logger.info(
+                            f"VQA V3 auto-fix: {len(applied)} applied, "
+                            f"{len(failed)} failed"
+                        )
+            except Exception as e:
+                logger.warning(f"VQA V3 Layer 1 failed (non-fatal): {e}")
+
             # ── 6b1: Pass 1 — Gemini (parallel across slides) ─────────────
             logger.info(
                 f"VQA 6b1: Pass 1 — {len(composites)} slides with "
@@ -2175,6 +2210,7 @@ class VisualQualityAssurance:
                 first_pass_results = self._dual_pass_evaluate(
                     composites=composites,
                     gemini_results=gemini_results,
+                    v3_xml_defects_by_slide=v3_xml_defects_by_slide,
                 )
             else:
                 first_pass_results = gemini_results
@@ -2431,6 +2467,7 @@ class VisualQualityAssurance:
         self,
         composites: List[Tuple[int, str]],
         gemini_results: List[VQASlideResult],
+        v3_xml_defects_by_slide: Optional[Dict[int, list]] = None,
     ) -> List[VQASlideResult]:
         """
         Run Pass 2 (Claude) + Reconciliation for dual-pass VQA.
@@ -2438,10 +2475,17 @@ class VisualQualityAssurance:
         Sequential per slide (Claude is the slower model; one API call at a time
         keeps costs predictable and avoids rate limits).
 
+        Args:
+            v3_xml_defects_by_slide: Dict mapping slide_num → list of V3Defect,
+                passed as XML context to Claude for more informed adjudication.
+
         Returns reconciled results for all slides.
         """
         if not self.claude_client:
             return gemini_results
+
+        if v3_xml_defects_by_slide is None:
+            v3_xml_defects_by_slide = {}
 
         # Index Gemini results and composites by slide number
         gemini_by_slide = {r.slide_number: r for r in gemini_results}
@@ -2463,7 +2507,7 @@ class VisualQualityAssurance:
                     composite_path=comp_path,
                     slide_number=sn,
                     gemini_result=gemini_result,
-                    xml_defects=None,  # TODO: wire Layer 1 defects from vqa_engine
+                    xml_defects=v3_xml_defects_by_slide.get(sn),  # V3: Layer 1 XML defects
                 )
 
                 # Layer 3: Deterministic reconciliation
@@ -2568,3 +2612,98 @@ def run_vqa(
     )
     vqa = VisualQualityAssurance(config)
     return vqa.run()
+
+
+def run_vqa_v3(
+    original_pptx: str,
+    converted_pptx: str,
+    max_slides: int = 20,
+    work_dir: Optional[str] = None,
+    vision_model: str = "gemini-3.1-pro-preview",
+    issue_log_path: Optional[str] = None,
+    deck_name: Optional[str] = None,
+    font_reduction_pct: int = 15,
+    min_font_pt: int = 8,
+    enable_dual_pass: bool = True,
+    claude_model: str = "claude-sonnet-4-6-20250514",
+    claude_api_key: Optional[str] = None,
+    max_parallel_slides: int = 5,
+) -> Tuple['VQAReport', Optional['VQAGateResult']]:
+    """
+    V3 quality-gated VQA entry point.
+
+    Runs the full V2 VQA pipeline (run_vqa) AND the V3 XML structural checks
+    + gate decision. Returns both the VQA report and a V3 gate result.
+
+    The V3 pipeline is controlled by v3_config feature flags:
+      - V3_XML_CHECKS=1    → enable XML structural checks
+      - V3_XML_AUTOFIX=1   → enable auto-fixes
+      - V3_TABLE_AUTOFIX=1 → enable table column reversal fix
+      - V3_GATE_MODE=shadow|active → shadow logs, active enforces
+
+    Returns:
+        (vqa_report, gate_result) — gate_result is None if V3 is disabled.
+    """
+    import v3_config
+
+    # Run standard VQA pipeline (which now internally runs V3 checks if enabled)
+    vqa_report = run_vqa(
+        original_pptx=original_pptx,
+        converted_pptx=converted_pptx,
+        max_slides=max_slides,
+        work_dir=work_dir,
+        vision_model=vision_model,
+        issue_log_path=issue_log_path,
+        deck_name=deck_name,
+        font_reduction_pct=font_reduction_pct,
+        min_font_pt=min_font_pt,
+        enable_dual_pass=enable_dual_pass,
+        claude_model=claude_model,
+        claude_api_key=claude_api_key,
+        max_parallel_slides=max_parallel_slides,
+    )
+
+    gate_result = None
+
+    if v3_config.is_v3_enabled():
+        try:
+            from v3_checks import run_v3_xml_checks, safe_apply_fixes, compute_gate_decision
+            from vqa_types import VQAGateResult
+
+            # Run V3 checks for gate decision (post-fix state)
+            defects, meta = run_v3_xml_checks(
+                orig_pptx_path=original_pptx,
+                conv_pptx_path=converted_pptx,
+            )
+
+            # Separate unresolved from fixed
+            from vqa_types import DefectStatus
+            unresolved = [d for d in defects if d.status != DefectStatus.FIXED]
+
+            # Compute gate decision
+            from pptx import Presentation as PptxPresentation
+            prs = PptxPresentation(converted_pptx)
+            total_slides = len(prs.slides)
+
+            gate_result = compute_gate_decision(unresolved, total_slides)
+            gate_result.slides_checked_xml = meta['slides_checked']
+            gate_result.defects_found = meta['total_defects']
+            gate_result.defects_fixed = meta['fixable_count'] - len(
+                [d for d in defects if d.fixable and d.status != DefectStatus.FIXED]
+            )
+
+            logger.info(
+                f"VQA V3 gate: {gate_result.status} "
+                f"({gate_result.critical_remaining} critical, "
+                f"{gate_result.high_remaining} high remaining)"
+            )
+
+            if v3_config.is_shadow_mode():
+                logger.info(f"VQA V3 gate (SHADOW): would be '{gate_result.status}'")
+
+        except Exception as e:
+            logger.error(f"VQA V3 gate computation failed: {e}")
+            from vqa_types import VQAGateResult
+            gate_result = VQAGateResult(status="vqa_error")
+
+    return vqa_report, gate_result
