@@ -644,18 +644,23 @@ class SlideContentTransformerV2:
                 return 0
 
         # ── Smart table mirroring ────────────────────────────────────
-        # Wide tables (>50% of slide width) are already roughly centered
-        # or spanning.  tblPr rtl='1' handles internal column reversal.
-        # Only narrow tables (<50% width) need positional mirroring.
+        # Round 4 fix: Mirror ALL tables regardless of width.
+        # Previous logic skipped tables >50% slide width, assuming
+        # rtl='1' handles internal column reversal. But for empty-style
+        # tables, rtl='1' doesn't reorder columns, and we now do
+        # physical reversal. Tables like Slide 18 (51.4% width) were
+        # NOT mirrored while adjacent text shapes WERE, causing overlap.
+        # Now: tables >90% width keep position (truly full-width),
+        # all others get mirrored.
         if cls.role == ShapeRole.TABLE and cls.position_action == 'mirror':
             try:
                 table_w = int(shape.width or 0)
-                if table_w > self._slide_width * 0.50:
+                if table_w > self._slide_width * 0.90:
                     logger.debug(
-                        'Wide table (%d > 50%% of %d): keeping position',
+                        'Full-width table (%d > 90%% of %d): keeping position',
                         table_w, self._slide_width,
                     )
-                    return 0  # Keep position for wide tables
+                    return 0  # Keep position for truly full-width tables
             except (TypeError, ValueError):
                 pass
 
@@ -1262,7 +1267,13 @@ class SlideContentTransformerV2:
                     for run in runs[1:]:
                         run.text = ''
                 else:
+                    # Round 4 fix: Remove <a:fld> (field) elements before
+                    # appending new run. Fields like slidenum render their
+                    # value; adding a run without removing the field causes
+                    # doubling (e.g., "15" + "15" = "1515").
                     p_elem = para._p
+                    for fld in p_elem.findall(f'{{{A_NS}}}fld'):
+                        p_elem.remove(fld)
                     r_elem = etree.SubElement(p_elem, f'{{{A_NS}}}r')
                     t_elem = etree.SubElement(r_elem, f'{{{A_NS}}}t')
                     t_elem.text = arabic_text
@@ -1433,34 +1444,42 @@ class SlideContentTransformerV2:
         """
         Determine if a table requires physical column reversal.
 
-        Returns True ONLY when `tableStyleId` is present and non-empty,
-        indicating a potentially unresolvable style ID (e.g., Google Slides
-        GUID exports) where PowerPoint may silently ignore `tblPr rtl='1'`.
+        Round 4 fix — 5-model UNANIMOUS consensus:
+        PowerPoint's `tblPr rtl='1'` only visually reorders columns
+        when a valid `tableStyleId` GUID is bound. For tables with
+        empty or absent `tableStyleId` (common in Google Slides exports),
+        `rtl='1'` affects only text direction WITHIN cells, NOT column
+        layout. Physical reversal is required for these tables.
 
-        Tables with absent/empty `tableStyleId` (including Google Slides
-        exports with no style) work correctly with `rtl='1'` alone.
-
-        Round 3 fix — 5-model consensus.
+        Returns True when `tableStyleId` is absent or empty (needs
+        physical reversal because `rtl='1'` won't mirror columns).
+        Returns False when `tableStyleId` is a non-empty GUID
+        (PowerPoint's style pipeline will honor `rtl='1'`).
         """
         if tbl_pr is None:
-            return False
+            return True  # No tblPr at all → needs physical reversal
         style_id = tbl_pr.get('tableStyleId', '').strip()
-        return bool(style_id)
+        # Empty or absent tableStyleId → physical reversal needed
+        # Non-empty GUID → PowerPoint style pipeline handles RTL
+        return not bool(style_id)
 
     def _handle_table(self, shape) -> int:
         """
         Transform table for RTL.
 
-        Strategy (5-model consensus, Round 3):
-        1) Set tblPr rtl='1' — primary RTL mechanism
-        2) Physically reverse columns ONLY when tableStyleId is present
-           (potential unresolvable Google GUID where rtl='1' is ignored)
-        3) Translate cell text
-        4) Set paragraph RTL properties + conservative alignment fix
+        Round 4 strategy (5-model UNANIMOUS consensus):
+        1) For tables WITH empty/absent tableStyleId (Google Slides exports):
+           - Physical column reversal (swap gridCol + tc elements)
+           - Set tblPr rtl='0' to prevent PowerPoint reinterpretation
+           - Per-cell RTL text properties
+        2) For tables WITH a valid tableStyleId GUID:
+           - Set tblPr rtl='1' (PowerPoint style pipeline handles mirroring)
+           - NO physical reversal (would cause double-reversal)
 
-        Round 3 correction: Tables with empty/absent tableStyleId work
-        correctly with rtl='1' alone. Physical reversal + rtl='1' on
-        these tables causes DOUBLE-REVERSAL (columns back to LTR).
+        Round 3/2 failures explained:
+        - Round 2: physical reversal + rtl='1' = double-reversal
+        - Round 3: rtl='1' alone on empty-style tables = no visual effect
+        - Round 4: physical reversal + rtl='0' = deterministic, correct
         """
         changes = 0
         try:
@@ -1482,45 +1501,46 @@ class SlideContentTransformerV2:
                 else:
                     tbl_elem.insert(0, tbl_pr)
 
-            # Always set logical RTL at table level
-            if tbl_pr.get('rtl') != '1':
-                tbl_pr.set('rtl', '1')
-                changes += 1
-
-            # Physical column reversal — ONLY for tables with unresolvable
-            # tableStyleId (e.g., Google Slides GUID exports).
-            # Tables with no tableStyleId work with rtl='1' alone.
             marker_attr = f'{{{SLIDEARABI_NS}}}physRtlCols'
             needs_physical = self._table_needs_physical_reversal(tbl_pr)
 
-            if needs_physical and tbl_pr.get(marker_attr) != '1':
-                changes += self._physically_reverse_table_columns(tbl_elem)
-                tbl_pr.set(marker_attr, '1')
-                # Swap firstCol/lastCol toggles when physical order changed
-                first_col = tbl_pr.get('firstCol')
-                last_col = tbl_pr.get('lastCol')
-                if first_col or last_col:
-                    tbl_pr.set('firstCol', last_col or '0')
-                    tbl_pr.set('lastCol', first_col or '0')
-                changes += 1
-                logger.debug(
-                    'Table "%s": physical reversal applied (tableStyleId present)',
-                    getattr(shape, 'name', '?'),
-                )
-            elif not needs_physical:
-                # Clear stale marker from prior buggy runs to prevent
-                # downstream Phase 3.6 from incorrectly repositioning icons
+            if needs_physical:
+                # Empty/absent tableStyleId → physical reversal + rtl='0'
+                if tbl_pr.get(marker_attr) != '1':
+                    changes += self._physically_reverse_table_columns(tbl_elem)
+                    tbl_pr.set(marker_attr, '1')
+                    # Swap firstCol/lastCol toggles when physical order changed
+                    first_col = tbl_pr.get('firstCol')
+                    last_col = tbl_pr.get('lastCol')
+                    if first_col or last_col:
+                        tbl_pr.set('firstCol', last_col or '0')
+                        tbl_pr.set('lastCol', first_col or '0')
+                    changes += 1
+                    logger.debug(
+                        'Table "%s": physical reversal applied (empty tableStyleId)',
+                        getattr(shape, 'name', '?'),
+                    )
+                # CRITICAL: Set rtl='0' to prevent double-reversal.
+                # Physical reversal is the source of truth for column order.
+                tbl_pr.set('rtl', '0')
+            else:
+                # Non-empty tableStyleId GUID → rtl='1' only (no physical)
+                if tbl_pr.get('rtl') != '1':
+                    tbl_pr.set('rtl', '1')
+                    changes += 1
+                # Clear stale physical-reversal marker from prior buggy runs
                 if tbl_pr.get(marker_attr):
                     try:
                         del tbl_pr.attrib[marker_attr]
                     except (KeyError, ValueError):
                         pass
                 logger.debug(
-                    'Table "%s": logical RTL only (no tableStyleId)',
+                    'Table "%s": logical RTL only (has tableStyleId GUID)',
                     getattr(shape, 'name', '?'),
                 )
 
-            # Translate cell text
+            # Translate cell text AFTER physical reversal to avoid
+            # DOM invalidation issues (Round 4, Gemini insight)
             if self.translations:
                 for row in table.rows:
                     for cell in row.cells:

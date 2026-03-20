@@ -95,13 +95,23 @@ class PipelineResult:
     validation_report: Optional[Any]
     total_duration_ms: float
     error: Optional[str] = None
+    gate_result: Optional[Any] = None  # V3 VQAGateResult (None if V3 disabled)
 
 # Phase 6 (VQA) and LLM translation — optional but wired when available
 try:
-    from slidearabi.visual_qa import run_vqa, VQAReport
+    from slidearabi.visual_qa import run_vqa, run_vqa_v3, VQAReport
     HAS_VQA = True
 except ImportError:
     HAS_VQA = False
+
+# V3 quality gate — optional
+HAS_V3_GATE = False
+try:
+    import v3_config
+    from v3_api_contract import build_status_response
+    HAS_V3_GATE = True
+except ImportError:
+    pass
 
 try:
     from slidearabi.llm_translator import DualLLMTranslator, TranslatorConfig
@@ -240,17 +250,27 @@ class SlideArabiPipeline:
                 raise IOError(f"Failed to save presentation: {e}")
             
             # Phase 6: Visual QA (dual-pass: Gemini + Claude)
-            vqa_report = self._phase_6_vqa()
+            vqa_report, gate_result = self._phase_6_vqa()
             
             total_duration = (time.monotonic() - pipeline_start) * 1000
             logger.info(f"Pipeline completed successfully in {total_duration:.0f}ms")
+            
+            # Log V3 gate decision at pipeline level
+            if gate_result is not None:
+                gate_status = getattr(gate_result, 'status', 'unknown')
+                logger.info(f"V3 quality gate: {gate_status}")
+                if HAS_V3_GATE and v3_config.is_gate_active():
+                    logger.info(f"V3 gate ACTIVE — terminal status: {gate_status}")
+                else:
+                    logger.info(f"V3 gate SHADOW — would be: {gate_status}")
             
             return PipelineResult(
                 success=True,
                 output_path=self.config.output_path,
                 phase_reports=self._phase_reports,
                 validation_report=val_report,
-                total_duration_ms=total_duration
+                total_duration_ms=total_duration,
+                gate_result=gate_result,
             )
             
         except Exception as e:
@@ -676,7 +696,7 @@ class SlideArabiPipeline:
 
     def _phase_6_vqa(
         self,
-    ) -> Any:
+    ) -> tuple:
         """Phase 6: Dual-pass Visual QA (Gemini 3.1 Pro + Claude Sonnet 4.6).
         
         Compares the original and converted PPTX visually:
@@ -685,6 +705,13 @@ class SlideArabiPipeline:
         - Layer 3: Deterministic reconciliation
         - Remediates FAIL slides (font reduction, alignment, etc.)
         - Logs all issues to JSONL for root-cause analysis
+        
+        When V3 is enabled, additionally computes a quality gate decision
+        from post-fix XML structural checks.
+        
+        Returns:
+            (vqa_report, gate_result) — gate_result is None when V3 is
+            disabled or if VQA is skipped entirely.
         """
         start_time = time.monotonic()
         logger.info("Phase 6: Visual QA...")
@@ -692,12 +719,12 @@ class SlideArabiPipeline:
         if not HAS_VQA:
             logger.warning("Phase 6 skipped: visual_qa module not available")
             self._log_phase('phase_6_vqa', 0, {"status": "module_unavailable"})
-            return None
+            return None, None
             
         if not self.config.input_path or not self.config.output_path:
             logger.warning("Phase 6 skipped: missing input/output paths")
             self._log_phase('phase_6_vqa', 0, {"status": "missing_paths"})
-            return None
+            return None, None
         
         # Set up issue log path alongside the output
         output_dir = Path(self.config.output_path).parent
@@ -705,16 +732,31 @@ class SlideArabiPipeline:
         issue_log_path = str(output_dir / f"{deck_stem}_vqa_issues.jsonl")
         
         try:
-            report = run_vqa(
-                original_pptx=self.config.input_path,
-                converted_pptx=self.config.output_path,
-                issue_log_path=issue_log_path,
-                deck_name=deck_stem,
-                enable_dual_pass=True,
-            )
+            # V3 path: run_vqa_v3 wraps run_vqa + post-fix XML gate decision
+            use_v3 = HAS_V3_GATE and v3_config.is_v3_enabled()
+            
+            if use_v3:
+                logger.info("Phase 6: Using V3 quality-gated VQA pipeline")
+                report, gate_result = run_vqa_v3(
+                    original_pptx=self.config.input_path,
+                    converted_pptx=self.config.output_path,
+                    issue_log_path=issue_log_path,
+                    deck_name=deck_stem,
+                    enable_dual_pass=True,
+                )
+            else:
+                report = run_vqa(
+                    original_pptx=self.config.input_path,
+                    converted_pptx=self.config.output_path,
+                    issue_log_path=issue_log_path,
+                    deck_name=deck_stem,
+                    enable_dual_pass=True,
+                )
+                gate_result = None
             
             duration = (time.monotonic() - start_time) * 1000
-            self._log_phase('phase_6_vqa', duration, {
+            
+            phase_log = {
                 "status": "success",
                 "overall_rating": report.overall_rating.value,
                 "pass_rate": round(report.pass_rate, 1),
@@ -723,10 +765,16 @@ class SlideArabiPipeline:
                 "remediation_attempted": report.remediation_attempted,
                 "remediation_successful": report.remediation_successful,
                 "issues_logged": report.issues_logged,
-            })
+            }
+            if gate_result is not None:
+                phase_log["v3_gate_status"] = getattr(gate_result, 'status', 'unknown')
+                phase_log["v3_critical_remaining"] = getattr(gate_result, 'critical_remaining', 0)
+                phase_log["v3_high_remaining"] = getattr(gate_result, 'high_remaining', 0)
+            
+            self._log_phase('phase_6_vqa', duration, phase_log)
             
             logger.info(report.summary())
-            return report
+            return report, gate_result
             
         except Exception as e:
             logger.warning(f"Phase 6 VQA failed (non-fatal): {e}")
@@ -735,7 +783,7 @@ class SlideArabiPipeline:
                 "status": "error",
                 "error": str(e),
             })
-            return None
+            return None, None
 
     def _log_phase(self, phase_name: str, duration_ms: float, report: Any):
         """Log phase completion with timing and summary."""
