@@ -364,13 +364,22 @@ class V3XMLChecker:
         from vqa_types import V3Defect, Severity
 
         defects = []
-        # Find graphic frames with images (pic elements)
-        orig_pics = orig_element.findall(f'.//{{{P_NS}}}pic') or []
-        conv_pics = conv_element.findall(f'.//{{{P_NS}}}pic') or []
+        # Find pic elements (deduplicated — blipFill parents may overlap with p:pic)
+        orig_pics_set = set()
+        for pic in orig_element.findall(f'.//{{{P_NS}}}pic'):
+            orig_pics_set.add(id(pic))
+        orig_pics = list(orig_element.findall(f'.//{{{P_NS}}}pic'))
+        for parent in orig_element.findall(f'.//{{{A_NS}}}blipFill/..'):
+            if id(parent) not in orig_pics_set:
+                orig_pics.append(parent)
 
-        # Also check for inline pics within shapes
-        orig_pics.extend(orig_element.findall(f'.//{{{A_NS}}}blipFill/..'))
-        conv_pics.extend(conv_element.findall(f'.//{{{A_NS}}}blipFill/..'))
+        conv_pics_set = set()
+        for pic in conv_element.findall(f'.//{{{P_NS}}}pic'):
+            conv_pics_set.add(id(pic))
+        conv_pics = list(conv_element.findall(f'.//{{{P_NS}}}pic'))
+        for parent in conv_element.findall(f'.//{{{A_NS}}}blipFill/..'):
+            if id(parent) not in conv_pics_set:
+                conv_pics.append(parent)
 
         if not orig_pics or not conv_pics:
             return defects
@@ -469,7 +478,8 @@ class V3XMLChecker:
                     for t in para.iter(f'{{{A_NS}}}t')
                 ).strip()
 
-                if all_text and len(all_text) >= 2 and len(all_text) % 2 == 0:
+                if all_text and len(all_text) >= 4 and len(all_text) % 2 == 0:
+                    # Require >= 4 chars to avoid false positive on "11" (page 11)
                     half = len(all_text) // 2
                     if all_text[:half] == all_text[half:] and all_text[:half].isdigit():
                         defects.append(V3Defect(
@@ -514,10 +524,8 @@ class V3XMLChecker:
             if nvSpPr is not None:
                 cNvPr = nvSpPr.find(f'{{{P_NS}}}cNvPr')
                 if cNvPr is not None:
-                    # Check for any slidearabi custom attributes
-                    for attr_name in cNvPr.attrib:
-                        if SLIDEARABI_NS in attr_name:
-                            continue  # Skip marked shapes
+                    if any(SLIDEARABI_NS in a for a in cNvPr.attrib):
+                        continue  # Skip marked shapes
 
             # Get position and size
             orig_off = orig_sp.find(f'.//{{{A_NS}}}off')
@@ -550,6 +558,8 @@ class V3XMLChecker:
                 continue
 
             expected_x = self.slide_width - orig_x - shape_w
+            if expected_x < 0:
+                continue  # Shape extends beyond slide boundary, skip
             tolerance = max(int(self.slide_width * 0.02), 12000)
 
             if abs(conv_x - expected_x) > tolerance:
@@ -873,7 +883,12 @@ class V3AutoFixer:
     # ── Fix #4: Deduplicate Page Number ──
 
     def _fix_dedup_page_number(self, slide_element, defect) -> bool:
-        """Remove duplicate <a:fld> slidenum elements, keep the first one."""
+        """Remove duplicate page number elements.
+        
+        Handles two cases:
+        - PAGE_NUMBER_DUPLICATED: duplicate <a:fld> elements → keep first, remove rest
+        - PAGE_NUMBER_DOUBLED_STRING: doubled text like '1515' → truncate to first half
+        """
         shapes = list(slide_element.iter(f'{{{P_NS}}}sp'))
 
         try:
@@ -888,16 +903,27 @@ class V3AutoFixer:
         fixed = False
 
         for para in sp.iter(f'{{{A_NS}}}p'):
+            # Case 1: Duplicate <a:fld> elements
             fields = [f for f in para.iter(f'{{{A_NS}}}fld')
                       if 'slidenum' in (f.get('type', '') or '').lower()]
 
             if len(fields) >= 2:
-                # Keep first, remove rest
                 for extra in fields[1:]:
                     parent = extra.getparent()
                     if parent is not None:
                         parent.remove(extra)
                         fixed = True
+                continue
+
+            # Case 2: Doubled-string in text runs
+            if defect.code == 'PAGE_NUMBER_DOUBLED_STRING':
+                doubled_text = defect.evidence.get('doubled_text', '')
+                if doubled_text and len(doubled_text) >= 2:
+                    half = doubled_text[:len(doubled_text) // 2]
+                    for t_elem in para.iter(f'{{{A_NS}}}t'):
+                        if t_elem.text and doubled_text in t_elem.text:
+                            t_elem.text = t_elem.text.replace(doubled_text, half)
+                            fixed = True
 
         if fixed:
             logger.info(f"V3 Fix: deduplicated page number on slide {defect.slide_idx}")
