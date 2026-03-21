@@ -96,6 +96,19 @@ class PipelineResult:
     total_duration_ms: float
     error: Optional[str] = None
     gate_result: Optional[Any] = None  # V3 VQAGateResult (None if V3 disabled)
+    consensus_vqa_report: Optional[Any] = None  # Vision-model consensus VQA report
+
+# Vision-Model Consensus VQA — parallel detect/verify with fix loop
+HAS_CONSENSUS_VQA = False
+try:
+    from slidearabi.consensus_vqa import run_consensus_vqa, ConsensusVQAReport
+    HAS_CONSENSUS_VQA = True
+except ImportError:
+    try:
+        from consensus_vqa import run_consensus_vqa, ConsensusVQAReport
+        HAS_CONSENSUS_VQA = True
+    except ImportError:
+        pass
 
 # Phase 6 (VQA) and LLM translation — optional but wired when available
 try:
@@ -249,11 +262,29 @@ class SlideArabiPipeline:
             except Exception as e:
                 raise IOError(f"Failed to save presentation: {e}")
             
-            # Phase 6: Visual QA (dual-pass: Gemini + Claude)
-            vqa_report, gate_result = self._phase_6_vqa()
+            # Phase 6: Vision-Model Consensus VQA
+            # Both Gemini 3.1 Pro and Claude Sonnet 4.6 must agree on
+            # problems, agree on fixes, and verify fixes worked.
+            consensus_vqa_report = self._phase_6_consensus_vqa()
+            
+            # Legacy dual-pass VQA (only if consensus VQA unavailable)
+            vqa_report, gate_result = (None, None)
+            if consensus_vqa_report is None:
+                vqa_report, gate_result = self._phase_6_vqa()
             
             total_duration = (time.monotonic() - pipeline_start) * 1000
             logger.info(f"Pipeline completed successfully in {total_duration:.0f}ms")
+            
+            # Log consensus VQA results
+            if consensus_vqa_report is not None:
+                logger.info(
+                    "Consensus VQA: %d slides, %d consensus issues, "
+                    "%d fixes verified, %d reverted to V2",
+                    getattr(consensus_vqa_report, 'total_slides', 0),
+                    getattr(consensus_vqa_report, 'consensus_issues', 0),
+                    getattr(consensus_vqa_report, 'fixes_verified', 0),
+                    getattr(consensus_vqa_report, 'fixes_reverted', 0),
+                )
             
             # Log V3 gate decision at pipeline level
             if gate_result is not None:
@@ -271,6 +302,7 @@ class SlideArabiPipeline:
                 validation_report=val_report,
                 total_duration_ms=total_duration,
                 gate_result=gate_result,
+                consensus_vqa_report=consensus_vqa_report,
             )
             
         except Exception as e:
@@ -693,6 +725,68 @@ class SlideArabiPipeline:
                 untranslated_slides.append(i)
 
         return untranslated_slides
+
+    def _phase_6_consensus_vqa(self) -> Optional[Any]:
+        """Phase 6: Vision-Model Consensus VQA.
+        
+        Both Gemini 3.1 Pro and Claude Sonnet 4.6 independently evaluate
+        each slide.  Only issues where both models agree on category
+        trigger the fix path.  After fixing, both models must verify the
+        fix worked before it ships.  Otherwise the original V2 output is
+        shipped unchanged.
+        
+        No pixel metrics.  No auto-fix loops.  One fix attempt, verified
+        or reverted.
+        
+        Returns:
+            ConsensusVQAReport or None if module unavailable.
+        """
+        start_time = time.monotonic()
+        logger.info("Phase 6: Vision-Model Consensus VQA...")
+        
+        if not HAS_CONSENSUS_VQA:
+            logger.warning("Phase 6 Consensus VQA skipped: module not available")
+            self._log_phase('phase_6_consensus_vqa', 0, {"status": "module_unavailable"})
+            return None
+        
+        if not self.config.input_path or not self.config.output_path:
+            logger.warning("Phase 6 Consensus VQA skipped: missing paths")
+            self._log_phase('phase_6_consensus_vqa', 0, {"status": "missing_paths"})
+            return None
+        
+        output_dir = Path(self.config.output_path).parent
+        deck_stem = Path(self.config.output_path).stem
+        issue_log_path = str(output_dir / f"{deck_stem}_consensus_vqa.jsonl")
+        
+        try:
+            report = run_consensus_vqa(
+                original_pptx=self.config.input_path,
+                converted_pptx=self.config.output_path,
+                deck_name=deck_stem,
+                issue_log_path=issue_log_path,
+            )
+            
+            duration = (time.monotonic() - start_time) * 1000
+            self._log_phase('phase_6_consensus_vqa', duration, {
+                "status": "success",
+                "total_slides": report.total_slides,
+                "consensus_issues": report.consensus_issues,
+                "fixes_attempted": report.fixes_attempted,
+                "fixes_verified": report.fixes_verified,
+                "fixes_reverted": report.fixes_reverted,
+                "slides_shipped_v2": report.slides_shipped_v2,
+            })
+            
+            return report
+            
+        except Exception as e:
+            logger.warning(f"Phase 6 Consensus VQA failed (non-fatal): {e}")
+            duration = (time.monotonic() - start_time) * 1000
+            self._log_phase('phase_6_consensus_vqa', duration, {
+                "status": "error",
+                "error": str(e),
+            })
+            return None
 
     def _phase_6_vqa(
         self,

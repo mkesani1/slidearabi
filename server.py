@@ -1079,6 +1079,7 @@ def debug_imports(token: str = ""):
             "HAS_TYPOGRAPHY": pipeline_module.HAS_TYPOGRAPHY,
             "HAS_STRUCTURAL_VALIDATOR": pipeline_module.HAS_STRUCTURAL_VALIDATOR,
             "HAS_VQA": getattr(pipeline_module, "HAS_VQA", False),
+            "HAS_CONSENSUS_VQA": getattr(pipeline_module, "HAS_CONSENSUS_VQA", False),
             "HAS_LLM_TRANSLATOR": getattr(pipeline_module, "HAS_LLM_TRANSLATOR", False),
         }
 
