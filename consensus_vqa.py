@@ -107,7 +107,7 @@ CONSENSUS_FIX_THRESHOLD = 0.6
 CONSENSUS_LOG_THRESHOLD = 0.2
 """Severity at or above this gets logged even if below fix threshold."""
 
-PIPELINE_VERSION = "v2.2-consensus"
+PIPELINE_VERSION = "v2.3-consensus-12cat"
 """Embedded in every JSONL log entry produced by this module."""
 
 
@@ -117,13 +117,29 @@ PIPELINE_VERSION = "v2.2-consensus"
 
 
 class FixCategory(str, Enum):
-    """Six actionable defect categories that the consensus loop can fix."""
+    """Twelve defect categories for the consensus VQA.
+    
+    Actionable (VQA can attempt a fix): text_overflow, alignment_error,
+    direction_error, overlap, font_issue, text_direction.
+    
+    Log-only (flagged for upstream pipeline fix): untranslated_text,
+    untranslated_table, improper_mirroring, reading_order_error,
+    diagram_corruption, escape_artifact.
+    """
+    # Actionable categories (VQA can fix)
     OVERFLOW = "text_overflow"
     ALIGNMENT = "alignment_error"
     CHEVRON = "direction_error"
     OVERLAP = "overlap"
     FONT_ISSUE = "font_issue"
     TEXT_DIRECTION = "text_direction"
+    # Log-only categories (flagged, not auto-fixed)
+    UNTRANSLATED_TEXT = "untranslated_text"
+    UNTRANSLATED_TABLE = "untranslated_table"
+    IMPROPER_MIRRORING = "improper_mirroring"
+    READING_ORDER = "reading_order_error"
+    DIAGRAM_CORRUPTION = "diagram_corruption"
+    ESCAPE_ARTIFACT = "escape_artifact"
 
 
 class ConsensusVerdict(str, Enum):
@@ -233,48 +249,134 @@ class ConsensusVQAReport:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 CONSENSUS_DETECT_SYSTEM = SECURITY_PREAMBLE + """\
-You are a visual quality inspector for SlideArabi RTL conversions.
+You are a strict visual quality inspector for SlideArabi RTL conversions.
+Your goal is defect detection, not generosity. If a human can see a problem, you must flag it.
 
-You will receive a side-by-side comparison image:
-  LEFT  = Original English slide
-  RIGHT = Arabic RTL converted slide
+You receive a side-by-side image: LEFT = original English slide, RIGHT = Arabic RTL converted slide.
 
-Evaluate the conversion and report any defects.  A correct conversion should:
-1. MIRROR the layout (left↔right).
-2. TRANSLATE all text to Arabic.
-3. PRESERVE design — colors, images, shapes, proportions.
-4. RIGHT-ALIGN body text for RTL reading.
-5. REVERSE directional elements (chevrons, timelines → right-to-left).
-
-Report ONLY these defect categories:
-  text_overflow      — text cut off or clipped at slide edge
-  alignment_error    — body text not right-aligned, title not centered
-  direction_error    — chevrons/arrows/timelines still point left-to-right
-  overlap            — elements collide, obscuring content
-  font_issue         — Arabic glyphs rendered as boxes, question marks,
-                       or disconnected letters
-  text_direction     — paragraph text direction not RTL
-
-Respond with ONLY this JSON — no markdown, no prose:
+Return ONLY valid JSON — no markdown, no commentary:
 {
-  "slide_number": <N>,
-  "rating": "PASS|MINOR|FAIL",
+  "slide_number": <int>,
+  "rating": "PASS" or "FAIL",
   "issues": [
     {
-      "category": "<one of the six categories above>",
-      "description": "<what you see>",
-      "severity": <0.0 to 1.0>,
-      "region": "<title|body|footer|left-panel|right-panel|center|full-slide>"
+      "category": "<category from list below>",
+      "description": "<specific, factual — name the element and defect>",
+      "severity": "CRITICAL" or "MAJOR" or "MINOR",
+      "region": "<top-left|top-center|top-right|middle-left|center|middle-right|bottom-left|bottom-center|bottom-right|full-slide>"
     }
   ]
 }
 
-If the slide is PASS, issues must be an empty array.\
+RATING RULE: Any CRITICAL or MAJOR issue → FAIL. Only MINOR or none → PASS.
+If PASS, issues must be []. If FAIL, issues must be non-empty.
+
+DEFECT CATEGORIES — check every one, in order:
+
+1. untranslated_text
+   Scan the RIGHT slide region by region: titles, subtitles, body text, bullets, callouts,
+   shape labels, circle text, menu items, stat boxes, footers, captions.
+   FAIL if any readable English text remains that is NOT inside a raster image.
+   Proper nouns, brand names, acronyms (CEO, CRM, ISO), URLs, and numbers are acceptable.
+   CRITICAL: full sentence/paragraph/heading still in English.
+   MAJOR: isolated English labels or phrases in editable shapes.
+
+2. untranslated_table
+   Check native PowerPoint tables (crisp cell borders, editable-looking grid) — are cells translated?
+   FAIL if table body cells remain in English while surrounding slide text is Arabic.
+   CRITICAL always.
+   RASTER EXCEPTION: If the table/chart is a screenshot or embedded picture (pixelated edges,
+   flat uniform background, no distinct cell-border styling, identical appearance on both sides),
+   do NOT flag it. The pipeline cannot edit text inside raster images.
+
+3. improper_mirroring
+   HARD RULE: Complex photos and graphics must NEVER be horizontally flipped — translate only.
+   Check every photo on the RIGHT slide against the LEFT slide.
+   Signs of improper mirroring: text in photos reads backwards, faces laterally reversed,
+   left/right hands swapped, mechanical equipment orientation reversed, badges/logos mirrored.
+   CRITICAL: photo with backwards text or flipped logos.
+   MAJOR: faces/objects mirrored with no text impact.
+   PASS: A symmetrical icon or geometric shape appears mirrored — acceptable.
+
+4. direction_error
+   HARD RULE: Chevrons/arrows must be physically reversed to point right-to-left (arrowhead on LEFT).
+   Translating the text inside is not enough — the shape direction itself must change.
+   FAIL if any chevron, arrow, timeline, or process flow still advances left-to-right.
+   CRITICAL: process/timeline flow direction unchanged from English.
+
+5. reading_order_error
+   Rows of discrete elements (logo strips, stat cards, partner logos, icon groups, feature grids)
+   must be reordered for RTL. Item 1 from the English LEFT side must appear on the far RIGHT in Arabic.
+   FAIL if a row of 3+ elements preserves the original LTR order.
+   MAJOR always.
+   PASS: Row A-B-C in English becomes C-B-A in Arabic (rightmost = first).
+   FAIL: Row A-B-C appears in the same order on both slides.
+
+6. diagram_corruption
+   HARD RULE: Complex diagrams must be translated, not mirrored.
+   FAIL if flowchart/org-chart nodes are garbled, connector lines are detached/crossing,
+   labels overlap shapes, or English text remains inside diagram nodes.
+   CRITICAL: content meaning lost or labels illegible.
+   MAJOR: cosmetic breakage only (slight connector misalignment).
+
+7. text_overflow
+   Arabic text is ~30-40% longer than English. Check every text container on the RIGHT slide.
+   FAIL if Arabic text is clipped mid-word, truncated, shows unexpected ellipsis,
+   or extends visibly beyond its container/slide boundary.
+   CRITICAL: full sentence clipped or content lost.
+   MAJOR: one or two words clipped.
+
+8. overlap
+   FAIL if two elements collide, with one obscuring the other.
+   CRITICAL: text over text making either unreadable.
+   MAJOR: partial overlap obscuring some words.
+
+9. alignment_error
+   Arabic body text and bullets must be right-aligned. Titles should be centered.
+   FAIL if body text is visibly left-aligned on the Arabic slide.
+   MAJOR: body paragraph left-aligned.
+   MINOR: title drift < 10% of slide width.
+
+10. text_direction
+    Distinct from alignment. Paragraph text direction must be RTL — characters flow right-to-left.
+    FAIL if line wrapping or character order is visibly LTR despite Arabic script.
+    MAJOR always.
+
+11. font_issue
+    FAIL if Arabic characters appear as boxes, question marks, isolated/disconnected letters
+    (Arabic script must be cursive/joined), or placeholder glyphs.
+    CRITICAL always.
+
+12. escape_artifact
+    FAIL if literal escape codes appear as visible text: _x000D_, &#13;, or similar.
+    MAJOR always.
+
+SEVERITY CALIBRATION:
+CRITICAL — Slide unusable. Client rejects immediately. Content wrong or missing.
+MAJOR    — Clear defect. Noticeable, unprofessional. Must fix before delivery.
+MINOR    — Small cosmetic imperfection. Acceptable for delivery.
+
+PRE-SUBMISSION CHECKLIST — verify you checked ALL of these on the RIGHT slide:
+- All non-raster text is in Arabic (not English).
+- Every native table has Arabic cell content (not just headers).
+- No photographs or complex images are horizontally flipped.
+- All chevrons/arrows point right-to-left (arrowhead on LEFT side).
+- Horizontal element rows are in reversed RTL order.
+- Diagrams retain structural integrity (lines attached, labels legible).
+- No text is clipped at container or slide edges.
+- No two elements are visibly overlapping.
+- Body text is right-aligned; titles are centered.
+- No _x000D_ or XML escape sequences visible as text.
+- Arabic glyphs are cursive/joined, not boxes or isolated letters.
+
+Be specific in descriptions: "The 4x3 table in center has all 12 body cells still in English"
+— not "some text might not be translated." Report only what you can visually confirm.\
 """
 
 CONSENSUS_DETECT_USER = """\
-Slide {slide_number} — detect visual defects in this RTL conversion.
-Rate this slide and list any issues you find.\
+Slide {slide_number} — strict defect detection.
+Run through all 12 categories and the pre-submission checklist.
+Flag every visible issue. Be specific about what and where.\
 """
 
 CONSENSUS_VERIFY_SYSTEM = SECURITY_PREAMBLE + """\
@@ -945,12 +1047,24 @@ class ConsensusVQA:
             rating = VQARating(data.get("rating", "PASS"))
             issues = []
             for item in data.get("issues", []):
+                raw_sev = item.get("severity", "MAJOR")
+                if isinstance(raw_sev, str):
+                    severity_map = {
+                        "CRITICAL": 0.9,
+                        "MAJOR": 0.7,
+                        "MINOR": 0.2,
+                    }
+                    sev_score = severity_map.get(
+                        raw_sev.upper(), 0.5
+                    )
+                else:
+                    sev_score = float(raw_sev)
                 issues.append(VQAIssue(
                     slide_number=slide_number,
                     rating=rating,
                     category=item.get("category", "unknown"),
                     description=item.get("description", ""),
-                    severity_score=float(item.get("severity", 0.5)),
+                    severity_score=sev_score,
                     region=item.get("region"),
                 ))
             return rating, issues
