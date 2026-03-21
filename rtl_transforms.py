@@ -940,6 +940,9 @@ class SlideContentTransformer:
         layout = slide.slide_layout
         layout_type = layout._element.get('type', 'cust')
 
+        # Reset per-slide state for numbered-section detection (Fix 5)
+        self._force_mirror_ids = set()
+
         # Override with classifier result if available
         if slide_number in self.layout_classifications:
             layout_type = self.layout_classifications[slide_number]
@@ -968,6 +971,14 @@ class SlideContentTransformer:
         # occlusion after RTL mirror).
         self._skip_master_layout_duplicates(
             slide, all_shapes, slide_number, panel_handled_shapes
+        )
+
+        # ── Pre-mirroring: detect numbered-section groups (Fix 5) ─────────
+        # Numbered step/process layouts (circle badges with "01", "02", etc.)
+        # must be mirrored as a unit. This marks all component shapes
+        # (badge + holding device + body text) for forced mirroring.
+        self._force_mirror_numbered_section_groups(
+            all_shapes, slide_number, panel_handled_shapes
         )
 
         individually_mirrored_shapes = set()  # shape ids mirrored by per-shape loop
@@ -1677,12 +1688,13 @@ class SlideContentTransformer:
                     # Preserve flipV for connectors (Opus recommendation)
                     # Horizontal mirror doesn't affect vertical flip
                 else:
-                    # REMOVE flipH/flipV for content shapes
+                    # REMOVE flipH for content shapes (horizontal mirror artifact)
                     if xfrm.get('flipH'):
                         del xfrm.attrib['flipH']
-                    # Remove flipV for content shapes only
-                    if xfrm.get('flipV'):
-                        del xfrm.attrib['flipV']
+                    # PRESERVE flipV for content shapes — vertical flip is NEVER
+                    # an artifact of horizontal mirroring. Removing it causes
+                    # upside-down boxes (confirmed bug on R6_14_s4 by Opus council).
+                    # flipV was intentional in the original design and must stay.
         except Exception:
             pass
 
@@ -1691,6 +1703,7 @@ class SlideContentTransformer:
         Determine if a non-placeholder shape should be mirrored.
 
         Decision rules:
+        - Force-mirror if shape was detected as part of a numbered-section group.
         - Full-width background shapes (width > 90% of slide): preserve (no mirror).
         - Logo images (small picture, < 20% width): mirror — handled by master,
           but any slide-level logos are also mirrored here.
@@ -1707,6 +1720,11 @@ class SlideContentTransformer:
             True if the shape should be mirrored.
         """
         try:
+            # Fix 5: Force-mirror shapes that are part of a numbered-section group.
+            # These must always be mirrored regardless of layout type or size.
+            if hasattr(self, '_force_mirror_ids') and id(shape) in self._force_mirror_ids:
+                return True
+
             slide_width = self._slide_width
 
             # Layout-specific rules for title/secHead layouts.
@@ -1903,14 +1921,18 @@ class SlideContentTransformer:
 
                 # Apply RTL paragraph properties
                 pPr = ensure_pPr(para._p)
+
+                # Capture original alignment BEFORE overwriting
+                original_algn = pPr.get('algn')  # 'l', 'r', 'ctr', 'just', or None
+
                 # Only set rtl='1' if content is actually Arabic
                 if has_arabic(final_text):
                     pPr.set('rtl', '1')
                 else:
                     pPr.set('rtl', '0')
 
-                # Determine alignment
-                alignment = self._compute_paragraph_alignment(final_text, ph_type)
+                # Determine alignment (pass original for centred-shape preservation)
+                alignment = self._compute_paragraph_alignment(final_text, ph_type, original_algn)
                 pPr.set('algn', alignment)
 
                 # Set rtlCol on bodyPr
@@ -1930,7 +1952,8 @@ class SlideContentTransformer:
         return changes
 
     def _compute_paragraph_alignment(
-        self, text: str, ph_type: Optional[str]
+        self, text: str, ph_type: Optional[str],
+        original_algn: Optional[str] = None
     ) -> str:
         """
         Compute the correct OOXML alignment value for a paragraph in RTL context.
@@ -1938,13 +1961,16 @@ class SlideContentTransformer:
         Rules (in priority order):
         1. Footer-type placeholders (ftr, sldNum, dt) → always 'l' (left).
         2. ctrTitle placeholder → 'ctr' (centred title is brand intent).
-        3. Predominantly Arabic text → 'r' (right-align).
-        4. Mixed/Latin text in Arabic context → 'r' (keep visual consistency).
-        5. Pure LTR/numeric text → 'l'.
+        3. Originally centred text → 'ctr' (preserve design intent).
+        4. All other text (source left-aligned or unset) → 'r' (right-align).
+           This applies regardless of script (Arabic, Latin, mixed, numeric).
+           The RTL layout principle: left-aligned source text becomes
+           right-aligned in the mirrored output.
 
         Args:
             text: The current paragraph text.
             ph_type: Placeholder type string or None for freeforms.
+            original_algn: Original OOXML algn value from source ('l', 'r', 'ctr', 'just', or None).
 
         Returns:
             OOXML algn attribute value: 'l', 'r', or 'ctr'.
@@ -1961,18 +1987,15 @@ class SlideContentTransformer:
         if ph_type and ('subtitle' not in ph_type.lower()) and ('title' in ph_type.lower()):
             return 'ctr'
 
-        ratios = compute_script_ratio(text)
-        arabic_ratio = ratios['arabic']
-        latin_ratio = ratios['latin']
+        # If the original paragraph was centred, preserve that (design intent).
+        if original_algn == 'ctr':
+            return 'ctr'
 
-        if arabic_ratio > 0.70:
-            return 'r'
-        elif latin_ratio > 0.70 and not has_arabic(text):
-            # Pure Latin text should remain left-aligned
-            return 'l'
-        else:
-            # Mixed content or ambiguous — default to right in Arabic context
-            return 'r'
+        # CORE RULE: All source left-aligned (or unset) text → right-align.
+        # This is the RTL mirroring principle — text that started on the left
+        # must end up on the right. Applies to ALL scripts: Arabic, Latin,
+        # numeric, mixed. No content-based exceptions.
+        return 'r'
 
 
     # ─────────────────────────────────────────────────────────────────────
@@ -2006,6 +2029,9 @@ class SlideContentTransformer:
 
                 pPr = ensure_pPr(para._p)
 
+                # Capture original alignment BEFORE overwriting
+                original_algn = pPr.get('algn')  # 'l', 'r', 'ctr', 'just', or None
+
                 # ONLY set rtl='1' if paragraph actually contains Arabic text.
                 # For English-only text, rtl='1' causes period displacement and
                 # word reordering — a confirmed P0 bug from VQA Round 1.
@@ -2016,8 +2042,8 @@ class SlideContentTransformer:
                     # from master/layout defaults
                     pPr.set('rtl', '0')
 
-                # Compute alignment based on placeholder type and content
-                alignment = self._compute_paragraph_alignment(text, ph_type)
+                # Compute alignment based on placeholder type, content, and original alignment
+                alignment = self._compute_paragraph_alignment(text, ph_type, original_algn)
                 pPr.set('algn', alignment)
 
                 changes += 1
@@ -3774,6 +3800,165 @@ class SlideContentTransformer:
                     getattr(s1, 'name', '?'), l1,
                     getattr(s2, 'name', '?'), l2,
                 )
+
+        return changes
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Pre-mirror: Numbered-section group detection (Fix 5)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _force_mirror_numbered_section_groups(
+        self, shapes: list, slide_number: int, handled_ids: set
+    ) -> int:
+        """
+        Detect numbered-section layouts (e.g., "01", "02", "03" columns with
+        circle badges and body text) and ensure ALL component shapes are
+        mirrored, even in secHead/title layouts where small shapes are normally
+        excluded from mirroring.
+
+        Pattern: A horizontal row of N ≥ 2 columns, each containing:
+        - A small shape (circle/badge/oval) with a short numeric label
+        - A body text shape directly below it
+        - Optionally a heading text shape between badge and body
+
+        These shapes form a numbered step/process layout and must ALL be
+        mirrored to maintain correct reading order in RTL.
+
+        This function does NOT reposition shapes itself — it adds their IDs
+        to handled_ids with a special flag so _should_mirror_shape can
+        force-include them. It actually marks them for forced mirroring by
+        adding them to self._force_mirror_ids.
+        """
+        changes = 0
+        if not hasattr(self, '_force_mirror_ids'):
+            self._force_mirror_ids = set()
+
+        try:
+            # Collect shapes with their bounding info
+            shape_info = []
+            for s in shapes:
+                try:
+                    left = getattr(s, 'left', None)
+                    top = getattr(s, 'top', None)
+                    w = getattr(s, 'width', None)
+                    h = getattr(s, 'height', None)
+                    if any(v is None for v in (left, top, w, h)):
+                        continue
+                    text = ''
+                    if getattr(s, 'has_text_frame', False) and s.has_text_frame:
+                        try:
+                            text = s.text_frame.text or ''
+                        except Exception:
+                            pass
+                    shape_info.append({
+                        'shape': s, 'id': id(s),
+                        'left': int(left), 'top': int(top),
+                        'width': int(w), 'height': int(h),
+                        'text': text.strip(),
+                        'cx': int(left) + int(w) // 2,
+                        'cy': int(top) + int(h) // 2,
+                    })
+                except Exception:
+                    continue
+
+            if len(shape_info) < 4:  # Need at least 2 badges + 2 bodies
+                return 0
+
+            slide_w = self._slide_width
+            slide_h = self._slide_height
+
+            # Step 1: Find candidate "badge" shapes — small, roughly square,
+            # with short text (1-3 chars, typically "01", "1", "A", etc.)
+            import re
+            _NUMBER_PATTERN = re.compile(r'^\d{1,3}$|^[A-Z]$|^[\u0660-\u0669]{1,3}$')
+            badges = []
+            for si in shape_info:
+                w, h = si['width'], si['height']
+                # Badge: small (< 15% of slide width), roughly square (aspect < 2)
+                if w > slide_w * 0.15 or h > slide_h * 0.15:
+                    continue
+                if w <= 0 or h <= 0:
+                    continue
+                aspect = max(w, h) / min(w, h)
+                if aspect > 2.5:
+                    continue
+                # Has short numeric/letter text
+                txt = si['text']
+                if txt and len(txt) <= 3 and _NUMBER_PATTERN.match(txt):
+                    badges.append(si)
+
+            if len(badges) < 2:
+                return 0
+
+            # Step 2: Check if badges form a horizontal row
+            # (similar Y position, different X positions)
+            _Y_TOLERANCE = slide_h * 0.08  # ~8% of slide height
+            # Group badges by Y band
+            badges_sorted = sorted(badges, key=lambda b: b['cy'])
+            rows = []
+            current_row = [badges_sorted[0]]
+            for b in badges_sorted[1:]:
+                if abs(b['cy'] - current_row[0]['cy']) < _Y_TOLERANCE:
+                    current_row.append(b)
+                else:
+                    if len(current_row) >= 2:
+                        rows.append(current_row)
+                    current_row = [b]
+            if len(current_row) >= 2:
+                rows.append(current_row)
+
+            if not rows:
+                return 0
+
+            # Step 3: For each badge row, find associated body text shapes
+            # (shapes below each badge, within the badge's X column)
+            for row in rows:
+                section_shapes = set()
+                for badge in row:
+                    section_shapes.add(badge['id'])
+                    badge_cx = badge['cx']
+                    badge_bottom = badge['top'] + badge['height']
+                    _X_COL_TOLERANCE = max(badge['width'] * 2, slide_w * 0.10)
+
+                    # Find shapes below this badge in the same column
+                    for si in shape_info:
+                        if si['id'] in section_shapes:
+                            continue
+                        # Must be below the badge
+                        if si['top'] < badge_bottom - _Y_TOLERANCE:
+                            continue
+                        # Must be within the badge's horizontal column
+                        if abs(si['cx'] - badge_cx) > _X_COL_TOLERANCE:
+                            continue
+                        # Must not be a full-width shape
+                        if si['width'] > slide_w * 0.5:
+                            continue
+                        section_shapes.add(si['id'])
+
+                # Also find any shape behind/under the badge (the circle holding device)
+                for badge in row:
+                    for si in shape_info:
+                        if si['id'] in section_shapes:
+                            continue
+                        # Overlaps the badge position (holding device/background circle)
+                        badge_cx, badge_cy = badge['cx'], badge['cy']
+                        if (abs(si['cx'] - badge_cx) < badge['width']
+                                and abs(si['cy'] - badge_cy) < badge['height']):
+                            # Similar size or larger than badge (it's the container)
+                            section_shapes.add(si['id'])
+
+                if len(section_shapes) >= len(row) * 2:
+                    # Valid numbered-section detected
+                    self._force_mirror_ids.update(section_shapes)
+                    logger.info(
+                        'Slide %d: detected numbered-section row with %d badges, '
+                        '%d total shapes forced for mirroring',
+                        slide_number, len(row), len(section_shapes)
+                    )
+                    changes += len(section_shapes)
+
+        except Exception as exc:
+            logger.debug('_force_mirror_numbered_section_groups: %s', exc)
 
         return changes
 

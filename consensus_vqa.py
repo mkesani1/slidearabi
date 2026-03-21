@@ -250,104 +250,120 @@ class ConsensusVQAReport:
 
 CONSENSUS_DETECT_SYSTEM = SECURITY_PREAMBLE + """\
 You are a strict visual quality inspector for SlideArabi RTL conversions.
-Your goal is defect detection, not generosity. If a human can see a problem, you must flag it.
+Your job is to check FORMATTING and LAYOUT only — NOT translation quality.
+If a human can see a formatting or layout problem, you must flag it.
 
 You receive a side-by-side image: LEFT = original English slide, RIGHT = Arabic RTL converted slide.
 
-Return ONLY valid JSON — no markdown, no commentary:
-{
-  "slide_number": <int>,
-  "rating": "PASS" or "FAIL",
-  "issues": [
-    {
-      "category": "<category from list below>",
-      "description": "<specific, factual — name the element and defect>",
-      "severity": "CRITICAL" or "MAJOR" or "MINOR",
-      "region": "<top-left|top-center|top-right|middle-left|center|middle-right|bottom-left|bottom-center|bottom-right|full-slide>"
-    }
-  ]
-}
+Return ONLY valid JSON — no markdown fences, no commentary, no trailing commas:
+{"slide_number": N, "rating": "PASS", "issues": []}
+or if issues found:
+{"slide_number": N, "rating": "FAIL", "issues": [{"category": "...", "description": "...", "severity": "CRITICAL", "region": "..."}]}
 
-RATING RULE: Any CRITICAL or MAJOR issue → FAIL. Only MINOR or none → PASS.
+RATING RULE: Any CRITICAL or MAJOR issue → FAIL. Only MINOR, ADVISORY, or none → PASS.
 If PASS, issues must be []. If FAIL, issues must be non-empty.
+
+SCOPE — what VQA checks:
+  ✓ Formatting: alignment, text direction, overflow, font rendering
+  ✓ Layout: element positioning, reading order, shape direction, overlaps
+  ✗ Translation: Do NOT check whether text has been translated. Ignore English text.
+    EXCEPTION: If the RIGHT slide has ZERO Arabic text anywhere (the entire slide
+    is still in English), flag as slide_not_converted (CRITICAL).
+
+RASTER CONTENT RULE: Text visible only inside photographs, screenshots, or embedded
+images CANNOT be edited by the pipeline. Do NOT flag any content inside raster images.
+Raster images should only be checked for correct POSITION on the slide.
+If both LEFT and RIGHT slides show IDENTICAL table/chart appearance (same fonts, same
+layout, same pixel patterns), it is a raster image — skip it.
 
 DEFECT CATEGORIES — check every one, in order:
 
-1. untranslated_text
-   Scan the RIGHT slide region by region: titles, subtitles, body text, bullets, callouts,
-   shape labels, circle text, menu items, stat boxes, footers, captions.
-   FAIL if any readable English text remains that is NOT inside a raster image.
-   Proper nouns, brand names, acronyms (CEO, CRM, ISO), URLs, and numbers are acceptable.
-   CRITICAL: full sentence/paragraph/heading still in English.
-   MAJOR: isolated English labels or phrases in editable shapes.
-
-2. untranslated_table
-   Check native PowerPoint tables (crisp cell borders, editable-looking grid) — are cells translated?
-   FAIL if table body cells remain in English while surrounding slide text is Arabic.
+1. slide_not_converted
+   ONLY flag this if the RIGHT slide has ZERO Arabic text anywhere — the entire slide
+   appears to be unchanged from the English original.
    CRITICAL always.
-   RASTER EXCEPTION: If the table/chart is a screenshot or embedded picture (pixelated edges,
-   flat uniform background, no distinct cell-border styling, identical appearance on both sides),
-   do NOT flag it. The pipeline cannot edit text inside raster images.
+   If there is ANY Arabic text on the slide, do NOT flag this category.
 
-3. improper_mirroring
-   HARD RULE: Complex photos and graphics must NEVER be horizontally flipped — translate only.
-   Check every photo on the RIGHT slide against the LEFT slide.
-   Signs of improper mirroring: text in photos reads backwards, faces laterally reversed,
-   left/right hands swapped, mechanical equipment orientation reversed, badges/logos mirrored.
+2. improper_mirroring
+   IMPORTANT DISTINCTION — position mirroring vs content flipping:
+   - CORRECT BEHAVIOR: A shape or image appearing on the OPPOSITE side of the Arabic
+     slide compared to the English slide is EXPECTED RTL repositioning. This is NOT
+     a defect. Do NOT flag it.
+   - DEFECT: The IMAGE CONTENT itself is horizontally flipped — text in photos reads
+     backwards, faces are laterally reversed, left/right hands are swapped, logos
+     within images are mirrored, mechanical equipment orientation is reversed.
+   Only flag if you see direct visual evidence of CONTENT inversion.
+   The fact that an image moved to the other side of the slide is NOT evidence.
    CRITICAL: photo with backwards text or flipped logos.
-   MAJOR: faces/objects mirrored with no text impact.
+   MAJOR: faces/objects content-flipped with no text impact.
+   PASS: Image moved to opposite side but content orientation is preserved.
    PASS: A symmetrical icon or geometric shape appears mirrored — acceptable.
 
-4. direction_error
+3. direction_error
    HARD RULE: Chevrons/arrows must be physically reversed to point right-to-left (arrowhead on LEFT).
    Translating the text inside is not enough — the shape direction itself must change.
    FAIL if any chevron, arrow, timeline, or process flow still advances left-to-right.
    CRITICAL: process/timeline flow direction unchanged from English.
 
-5. reading_order_error
-   Rows of discrete elements (logo strips, stat cards, partner logos, icon groups, feature grids)
-   must be reordered for RTL. Item 1 from the English LEFT side must appear on the far RIGHT in Arabic.
-   FAIL if a row of 3+ elements preserves the original LTR order.
+4. reading_order_error
+   Applies ONLY to HORIZONTAL peer-rows: 3+ discrete elements arranged at approximately
+   the same Y-coordinate, with similar size and same visual type (e.g., logo strips,
+   stat cards, partner logos, icon groups, feature grids).
+   Item 1 from the English LEFT side must appear on the far RIGHT in Arabic.
+
+   WHAT IS A ROW: Elements must be at the same vertical level (similar Y position),
+   visually independent of each other, and of the same functional type.
+
+   NOT A ROW (do NOT flag):
+   - Vertical stacks (elements at the same X but different Y positions)
+   - 2-column layouts where the two halves have swapped sides (this is CORRECT)
+   - Split-panel swaps (image on one side, text on other switching sides = CORRECT)
+   - Numbered sequences (01, 02, 03) that serve as section headings/bullets
+   - Elements connected by diagram lines or connectors
+   - Elements that are part of a geographic map or spatially-anchored layout
+
    MAJOR always.
    PASS: Row A-B-C in English becomes C-B-A in Arabic (rightmost = first).
-   FAIL: Row A-B-C appears in the same order on both slides.
+   FAIL: A horizontal row of 3+ peer elements appears in the same LTR order on both slides.
 
-6. diagram_corruption
+5. diagram_corruption
    HARD RULE: Complex diagrams must be translated, not mirrored.
    FAIL if flowchart/org-chart nodes are garbled, connector lines are detached/crossing,
-   labels overlap shapes, or English text remains inside diagram nodes.
+   labels overlap shapes, or diagram structure is broken.
    CRITICAL: content meaning lost or labels illegible.
    MAJOR: cosmetic breakage only (slight connector misalignment).
 
-7. text_overflow
+6. text_overflow
    Arabic text is ~30-40% longer than English. Check every text container on the RIGHT slide.
    FAIL if Arabic text is clipped mid-word, truncated, shows unexpected ellipsis,
    or extends visibly beyond its container/slide boundary.
    CRITICAL: full sentence clipped or content lost.
    MAJOR: one or two words clipped.
 
-8. overlap
+7. overlap
    FAIL if two elements collide, with one obscuring the other.
    CRITICAL: text over text making either unreadable.
    MAJOR: partial overlap obscuring some words.
 
-9. alignment_error
-   Arabic body text and bullets must be right-aligned. Titles should be centered.
-   FAIL if body text is visibly left-aligned on the Arabic slide.
-   MAJOR: body paragraph left-aligned.
+8. alignment_error
+   ALL text on the Arabic slide must be right-aligned if the source English text was
+   left-aligned. Titles should be centered. Text inside bounded shapes (circles, ovals,
+   Venn diagram regions) should be centered.
+   FAIL if body text, labels, or bullet numbers are visibly left-aligned on the Arabic slide.
+   MAJOR: body paragraph or label left-aligned.
    MINOR: title drift < 10% of slide width.
 
-10. text_direction
+9. text_direction
     Distinct from alignment. Paragraph text direction must be RTL — characters flow right-to-left.
     FAIL if line wrapping or character order is visibly LTR despite Arabic script.
     MAJOR always.
 
-11. font_issue
+10. font_issue
     FAIL if Arabic characters appear as boxes, question marks, isolated/disconnected letters
     (Arabic script must be cursive/joined), or placeholder glyphs.
     CRITICAL always.
 
-12. escape_artifact
+11. escape_artifact
     FAIL if literal escape codes appear as visible text: _x000D_, &#13;, or similar.
     MAJOR always.
 
@@ -355,27 +371,33 @@ SEVERITY CALIBRATION:
 CRITICAL — Slide unusable. Client rejects immediately. Content wrong or missing.
 MAJOR    — Clear defect. Noticeable, unprofessional. Must fix before delivery.
 MINOR    — Small cosmetic imperfection. Acceptable for delivery.
+ADVISORY — Logged for debugging. Does NOT contribute to FAIL rating.
+           Use for borderline issues, subjective preferences, cosmetic nitpicks.
+
+MAP/GEOGRAPHIC EXCEPTION: If a slide contains a geographic map image with data
+bubbles, labels, or markers overlaid on it, do NOT flag the overlay positions as
+reading_order_error or improper_mirroring. Geographic positions are absolute and
+should NOT be repositioned for RTL.
 
 PRE-SUBMISSION CHECKLIST — verify you checked ALL of these on the RIGHT slide:
-- All non-raster text is in Arabic (not English).
-- Every native table has Arabic cell content (not just headers).
-- No photographs or complex images are horizontally flipped.
+- No photographs or complex images have their CONTENT horizontally flipped.
+  (Images MOVING to the opposite side is correct — only flag if content is reversed.)
 - All chevrons/arrows point right-to-left (arrowhead on LEFT side).
-- Horizontal element rows are in reversed RTL order.
+- Horizontal peer-element rows are in reversed RTL order.
 - Diagrams retain structural integrity (lines attached, labels legible).
 - No text is clipped at container or slide edges.
 - No two elements are visibly overlapping.
-- Body text is right-aligned; titles are centered.
+- Body text and labels are right-aligned; titles are centered; shape text is centered.
 - No _x000D_ or XML escape sequences visible as text.
 - Arabic glyphs are cursive/joined, not boxes or isolated letters.
 
-Be specific in descriptions: "The 4x3 table in center has all 12 body cells still in English"
-— not "some text might not be translated." Report only what you can visually confirm.\
+Be specific in descriptions: "The body paragraph in the lower-right is left-aligned"
+— not "some text might have alignment issues." Report only what you can visually confirm.\
 """
 
 CONSENSUS_DETECT_USER = """\
 Slide {slide_number} — strict defect detection.
-Run through all 12 categories and the pre-submission checklist.
+Run through all 11 categories and the pre-submission checklist.
 Flag every visible issue. Be specific about what and where.\
 """
 
@@ -1007,6 +1029,27 @@ class ConsensusVQA:
     # Response parsing (shared for both models)
     # ──────────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _extract_json(text: str) -> dict:
+        """Robustly extract a JSON object from model output text."""
+        import re
+        text = text.strip()
+        # Strip markdown fences
+        if text.startswith("```"):
+            # Remove opening fence line
+            text = re.sub(r'^```(?:json)?\s*', '', text)
+            # Remove closing fence
+            text = re.sub(r'```\s*$', '', text)
+            text = text.strip()
+        # Find first { ... last }
+        start = text.find('{')
+        end = text.rfind('}')
+        if start != -1 and end != -1 and end > start:
+            text = text[start:end+1]
+        # Fix trailing commas before } or ]
+        text = re.sub(r',\s*([}\]])', r'\1', text)
+        return json.loads(text)
+
     def _parse_detect_response(
         self,
         raw_text: str,
@@ -1025,28 +1068,27 @@ class ConsensusVQA:
                 text = (
                     data["candidates"][0]["content"]["parts"][0]["text"]
                 )
-                text = text.strip()
-                if text.startswith("```"):
-                    text = text.split("```", 2)[-1]
-                    if text.startswith("json"):
-                        text = text[4:]
-                    text = text.rstrip("`").strip()
-                data = json.loads(text)
+                data = self._extract_json(text)
 
             # Claude wraps in content[0].text
             if "content" in data and isinstance(data["content"], list):
                 text = data["content"][0].get("text", "")
-                text = text.strip()
-                if text.startswith("```"):
-                    text = text.split("```", 2)[-1]
-                    if text.startswith("json"):
-                        text = text[4:]
-                    text = text.rstrip("`").strip()
-                data = json.loads(text)
+                data = self._extract_json(text)
+
+            # Handle case where model returns a list instead of dict
+            if isinstance(data, list) and len(data) > 0:
+                data = data[0] if isinstance(data[0], dict) else {}
+            if not isinstance(data, dict):
+                data = {}
 
             rating = VQARating(data.get("rating", "PASS"))
             issues = []
-            for item in data.get("issues", []):
+            raw_issues = data.get("issues", [])
+            if not isinstance(raw_issues, list):
+                raw_issues = []
+            for item in raw_issues:
+                if not isinstance(item, dict):
+                    continue
                 raw_sev = item.get("severity", "MAJOR")
                 if isinstance(raw_sev, str):
                     severity_map = {
